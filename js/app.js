@@ -1,9 +1,12 @@
-import { analyzeEvent, cellMask } from './model.js';
-import { filterPicks, buildPool, optimizeSystem, alternativesFor, findTargetCombos, OBJECTIVES, hashString, mulberry32 } from './optimizer.js';
-import { evaluateSystem, columnCount, payoutFor } from './system.js';
-import { GROUPS, MARKETS, settlePick } from './markets.js';
-import { searchSystems } from './autosystem.js';
-import * as api from './api.js';
+import { analyzeEvent, cellMask } from './model.js?v=5';
+import { filterPicks, buildPool, optimizeSystem, alternativesFor, findTargetCombos, OBJECTIVES, hashString, mulberry32 } from './optimizer.js?v=5';
+import { evaluateSystem, columnCount, payoutFor } from './system.js?v=5';
+import { GROUPS, MARKETS, settlePick } from './markets.js?v=5';
+import { searchSystems } from './autosystem.js?v=5';
+import * as api from './api.js?v=5';
+
+// Bump together with version.json on every release: an older copy on the phone reloads itself.
+const APP_VERSION = 5;
 
 // ---------- settings & storage ----------
 const SETTINGS_VERSION = 4;
@@ -1019,6 +1022,7 @@ function settingsHtml() {
     <button class="btn" data-set="reset">Varsayılanlar</button>
     <button class="btn primary" data-set="close">Uygula</button>
   </div>
+  <div class="row between mt16"><span class="small muted">Sürüm ${APP_VERSION}</span><button class="btn sm" data-set="update"><svg><use href="#i-refresh"/></svg>Güncellemeyi zorla</button></div>
   ${installHint()}`;
 }
 
@@ -1066,6 +1070,7 @@ function onSettingsAction(t) {
   else if (k === 'maxPerLeague') { s.maxPerLeague = Number(t.dataset.v); settingsDirty.regen = true; }
   else if (k === 'reset') { state.settings = { ...DEFAULTS }; settingsDirty = { reanalyze: true, regen: true }; }
   else if (k === 'install') { state.installPrompt?.prompt(); state.installPrompt = null; return; }
+  else if (k === 'update') { forceUpdate(); return; }
   else if (k === 'close') { closeSheet(); return; }
   saveSettings();
   const top = $('#sheet-body').scrollTop;
@@ -1131,7 +1136,31 @@ function render() {
 
 function statusLine() {
   const n = state.events.length;
-  return state.updatedAt ? `${n} maç · güncellendi ${fmtTime(state.updatedAt / 1000)}` : `${n} maç`;
+  return `${state.updatedAt ? `${n} maç · güncellendi ${fmtTime(state.updatedAt / 1000)}` : `${n} maç`} · v${APP_VERSION}`;
+}
+
+// Drop every cached copy of the app and load it again from the server.
+async function forceUpdate() {
+  try {
+    if ('caches' in window) for (const k of await caches.keys()) await caches.delete(k);
+    const regs = (await navigator.serviceWorker?.getRegistrations?.()) || [];
+    for (const r of regs) await r.unregister();
+  } catch { /* ignore */ }
+  location.replace(`${location.pathname}?v=${Date.now()}`);
+}
+
+// If the server has a newer version than this copy, update once automatically.
+async function checkForUpdate() {
+  try {
+    const r = await fetch(`version.json?t=${Date.now()}`, { cache: 'no-store' });
+    if (!r.ok) return;
+    const { v } = await r.json();
+    if (v > APP_VERSION && sessionStorage.getItem('sk-updated') !== String(v)) {
+      sessionStorage.setItem('sk-updated', String(v));
+      toast('Yeni sürüm yükleniyor…');
+      forceUpdate();
+    }
+  } catch { /* offline: keep running this copy */ }
 }
 
 // ---------- events ----------
@@ -1471,4 +1500,7 @@ if ('serviceWorker' in navigator && location.protocol === 'https:') {
 
 api.cleanCache();
 render();
+checkForUpdate();
 loadAll();
+// a phone can keep the app open for days: check again whenever it comes back to the screen
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') checkForUpdate(); });

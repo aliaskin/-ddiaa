@@ -48,6 +48,10 @@ python3 -m http.server 8000           # http://localhost:8000
 node tests/live-check.mjs             # modeli canlı veriyle dener (proxy arkasında: NODE_USE_ENV_PROXY=1)
 ```
 
+## Yeni sürüm çıkarırken
+
+`js/app.js` içindeki `APP_VERSION`, `version.json` ve dosya adreslerindeki `?v=` numarasını birlikte artır (`index.html` ve `js/*.js` içindeki import'lar). Telefondaki eski kopya açılışta yeni sürümü görüp kendini yeniler.
+
 ## Yayınlama (GitHub Pages)
 
 Repo ayarlarında **Settings → Pages → Build and deployment → Deploy from a branch**, dal olarak bu dalı ve `/ (root)` klasörünü seç. Ücretsiz GitHub hesabında Pages yalnızca herkese açık (public) depolarda çalışır.
