@@ -6,7 +6,7 @@
 //    and blend it in.
 // Every pick then gets one consistent probability from the same score distribution.
 
-import { MARKETS, normalizeMarkets, pickId, pickLabel } from './markets.js?v=6';
+import { MARKETS, normalizeMarkets, pickId, pickLabel } from './markets.js?v=7';
 
 const G = 10; // full-time goals grid 0..G per team
 const GH = 6; // per-half goals grid 0..GH per team

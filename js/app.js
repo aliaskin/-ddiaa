@@ -1,12 +1,13 @@
-import { analyzeEvent, cellMask } from './model.js?v=6';
-import { filterPicks, buildPool, optimizeSystem, alternativesFor, findTargetCombos, OBJECTIVES, hashString, mulberry32 } from './optimizer.js?v=6';
-import { evaluateSystem, columnCount, payoutFor } from './system.js?v=6';
-import { GROUPS, MARKETS, settlePick } from './markets.js?v=6';
-import { searchSystems } from './autosystem.js?v=6';
-import * as api from './api.js?v=6';
+import { analyzeEvent, cellMask } from './model.js?v=7';
+import { filterPicks, buildPool, optimizeSystem, alternativesFor, findTargetCombos, OBJECTIVES, hashString, mulberry32 } from './optimizer.js?v=7';
+import { evaluateSystem, columnCount, payoutFor } from './system.js?v=7';
+import { GROUPS, MARKETS, settlePick } from './markets.js?v=7';
+import { searchSystems } from './autosystem.js?v=7';
+import * as api from './api.js?v=7';
+import { loadDay, saveDay } from './daystore.js?v=7';
 
 // Bump together with version.json on every release: an older copy on the phone reloads itself.
-const APP_VERSION = 6;
+const APP_VERSION = 7;
 
 // ---------- settings & storage ----------
 const SETTINGS_VERSION = 5;
@@ -29,6 +30,8 @@ const HIGH_ODDS_PRESET = {
   // goals wanted: no unders / KG Yok / 0-0 style picks, and no "underdog wins" picks
   goalMode: true,
   noUpset: true,
+  // daily coupon: at most this many matches may kick off after midnight, the rest waits for the next day
+  maxLate: 3,
 };
 const DEFAULTS = {
   v: SETTINGS_VERSION,
@@ -108,18 +111,25 @@ function dayLabel(d) {
   if (k(t) === k(tm)) return 'Yarın';
   return t.toLocaleDateString('tr-TR', { weekday: 'long', day: 'numeric', month: 'long' });
 }
-// A "game day" runs 06:00 → 06:00 so late-night matches belong to the same day.
+// The coupon day is the Turkish calendar day (00:00 – 24:00, Turkey is UTC+3 all year).
+const TR_OFFSET = 3 * 3600e3;
 function gameDay(ts = Date.now()) {
-  const d = new Date(ts - 6 * 3600e3);
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  return new Date(ts + TR_OFFSET).toISOString().slice(0, 10);
 }
+// Next 00:00 in Turkey, in seconds.
+function nextMidnight(ts = Date.now()) {
+  const day = 864e5;
+  return (Math.floor((ts + TR_OFFSET) / day) * day + day - TR_OFFSET) / 1000;
+}
+function dayStart(ts = Date.now()) {
+  return nextMidnight(ts) - 86400;
+}
+// Today's coupon may use today's matches plus night matches until 06:00 (max settings.maxLate of them).
 function windowEnd(win) {
   const now = Date.now() / 1000;
   if (win === '24') return now + 86400;
   if (win === '48') return now + 2 * 86400 + 3600;
-  const e = new Date(); e.setHours(6, 0, 0, 0);
-  while (e.getTime() / 1000 < now + 12 * 3600) e.setDate(e.getDate() + 1);
-  return e.getTime() / 1000;
+  return nextMidnight() + 6 * 3600;
 }
 const sizesLabel = (sizes) => sizes.slice().sort((a, b) => a - b).join('-');
 // Turkish suffixes for numbers: 3'lü, 6'lı / 2'den, 3'ten
@@ -188,7 +198,8 @@ function analyzeOne(e) {
     simRange: [state.settings.minOdd, state.settings.maxOdd], simRuns: 10000, seed: hashString(gameDay()),
   });
   if (!a) { state.analyses.delete(e.i); return; }
-  for (const p of a.picks) { p.league = e.ci; p.d = e.d; }
+  const late = e.d >= nextMidnight();
+  for (const p of a.picks) { p.league = e.ci; p.d = e.d; p.late = late; }
   state.analyses.set(e.i, a);
 }
 
@@ -247,7 +258,7 @@ function optOptions(locked, sys = couponSys()) {
   const s = state.settings;
   return {
     n: sys.n, sizes: sys.sizes, misli: sys.misli, unit: sys.unit, objective: s.objective,
-    target: s.targetWin, locked, maxPerLeague: s.maxPerLeague,
+    target: s.targetWin, locked, maxPerLeague: s.maxPerLeague, maxLate: s.maxLate ?? 3,
     seed: hashString(`${gameDay()}|${s.objective}|${sys.n}|${sys.sizes.join(',')}`),
   };
 }
@@ -313,9 +324,10 @@ function saveCoupon() {
 
 function lockedFrom(prev, keepIds) {
   const now = Date.now() / 1000;
+  // when refilling the day's coupon, picks whose match already started stay in it
   return prev.ids.filter((id) => prev.locked.has(id) || keepIds)
     .map((id) => state.pickById.get(id)).filter(Boolean)
-    .filter((p) => p.d > now + 120);
+    .filter((p) => keepIds || p.d > now + 120);
 }
 
 // Fill the coupon for a fixed system layout (manual mode, or refilling an auto coupon).
@@ -334,7 +346,13 @@ function fillCoupon(sys, { keepIds = false } = {}) {
       const cur = bestPer.get(p.eventId);
       if (!cur || p.p > cur.p) bestPer.set(p.eventId, p);
     }
-    lockedPicks = lockedPicks.concat([...bestPer.values()].sort((a, b) => b.p - a.p)).slice(0, sys.n);
+    let late = lockedPicks.filter((p) => p.late).length;
+    for (const p of [...bestPer.values()].sort((a, b) => b.p - a.p)) {
+      if (lockedPicks.length >= sys.n) break;
+      if (p.late && late >= (state.settings.maxLate ?? 3)) continue;
+      if (p.late) late++;
+      lockedPicks.push(p);
+    }
     pool = buildPool(eligiblePicks({ maxMbc: minSizeOf(sys), groups: ALL_GOAL_GROUPS }), 4, 160);
   }
   const r = optimizeSystem(pool, optOptions(lockedPicks, sys));
@@ -363,7 +381,7 @@ async function buildCoupon({ keepIds = false } = {}) {
   for (const p of locked) if (!picks.includes(p)) picks.push(p);
   const res = searchSystems(picks, {
     minN: s.autoMinN, maxN: s.autoMaxN, budget: s.budget, minStake: s.minStake, unit: s.unit,
-  }, { objective: s.objective, target: s.targetWin, locked, maxPerLeague: s.maxPerLeague, seedBase: `${gameDay()}|${s.objective}` });
+  }, { objective: s.objective, target: s.targetWin, locked, maxPerLeague: s.maxPerLeague, maxLate: s.maxLate ?? 3, seedBase: `${gameDay()}|${s.objective}` });
   setProgress(null);
   setStatus(statusLine());
   const best = res.ranking[0];
@@ -449,7 +467,7 @@ function renderPick(p, i, locked) {
       <button data-act="swap" data-i="${i}" aria-label="Değiştir"><svg><use href="#i-swap"/></svg></button>
       <button data-act="remove" data-i="${i}" aria-label="Maçı çıkar"><svg><use href="#i-x"/></svg></button>
     </div>
-    <div class="meta">${flagImg(p.league)}<span class="ellipsis">${fmtTime(p.d)} · ${esc(c.n)}</span></div>
+    <div class="meta">${flagImg(p.league)}<span class="ellipsis">${p.late ? '<span class="badge info">gece</span> ' : ''}${fmtTime(p.d)} · ${esc(c.n)}</span></div>
     <div class="teams" data-act="match" data-id="${p.eventId}">${e ? `${esc(e.hn)} – ${esc(e.an)}` : 'Maç'}</div>
     <div class="sel">
       <span class="label">${esc(p.label)}</span>
@@ -614,9 +632,21 @@ function renderKupon() {
   const need = couponSys().n;
   let body = '';
   if (!picks.length || picks.length < need) {
-    body = `<div class="warnbox mt12">Ayarlarına uyan yeterli maç bulunamadı (${picks.length}/${need}). Oran aralığını, bahis türlerini ya da maç zamanını genişletmeyi dene.</div>`;
+    const now = Date.now() / 1000;
+    const elig = state.events.filter((e) => eventEligible(e, now));
+    const todayN = elig.filter((e) => e.d < nextMidnight()).length;
+    const lateN = elig.length - todayN;
+    const maxLate = s.maxLate ?? 3;
+    body = todayN + Math.min(lateN, maxLate) < need && s.window === 'today'
+      ? `<div class="warnbox mt12">Bugün için kalan maçlar ${need} maçlık kupona yetmiyor (bugün ${todayN} maç + gece 00:00'dan sonra en fazla ${maxLate} maç). <b>Yarının kuponu 00:00'da hazırlanır.</b></div>`
+      : `<div class="warnbox mt12">Ayarlarına uyan yeterli maç bulunamadı (${picks.length}/${need}). Oran aralığını, bahis türlerini ya da maç zamanını genişletmeyi dene.</div>`;
   }
-  body += `<div class="section-title"><h2>Günün kuponu</h2><small>${dayLabel(Date.now() / 1000)} · ${state.updatedAt ? 'oranlar ' + fmtTime(state.updatedAt / 1000) : ''}</small></div>`;
+  const dayName = new Date(Date.now() + TR_OFFSET).toLocaleDateString('tr-TR', { day: 'numeric', month: 'long', weekday: 'long', timeZone: 'UTC' });
+  body += `<div class="section-title"><h2>${esc(dayName)} kuponu</h2><small>${state.updatedAt ? 'analiz ' + fmtTime(state.updatedAt / 1000) : ''}</small></div>`;
+  if (picks.length) {
+    const late = picks.filter((p) => p.late).length;
+    body += `<p class="note" style="margin:-4px 2px 8px">Gece 00:00'dan sonraki maç: <b>${late}</b> (en fazla ${s.maxLate ?? 3}). Diğer gece maçları yarının kuponuna kalır; yeni günün analizi 00:00'da yapılır.</p>`;
+  }
   if (picks.length) {
     const first = Math.min(...picks.map((p) => p.d));
     const mins = Math.round((first - Date.now() / 1000) / 60);
@@ -1043,6 +1073,7 @@ function settingsHtml() {
   </div>
   <div class="field">
     <label class="switch"><span>Gol bekle: Alt, KG Yok, 0-0 gibi az gollü seçimleri alma</span><input type="checkbox" ${s.goalMode ? 'checked' : ''} data-setcb="goalMode"></label>
+    <div class="switch"><span>Gece 00:00'dan sonra en fazla maç</span><div class="stepper"><button data-set="maxLate" data-d="-1">−</button><input value="${s.maxLate ?? 3}" readonly aria-label="Gece maçı sınırı"><button data-set="maxLate" data-d="1">+</button></div></div>
     <label class="switch"><span>Sürpriz galibiyet oynama (kazanma ihtimali %22'nin altındaki takıma "kazanır" yok; İY/MS 1/2 – 2/1 favori kazanıyorsa serbest)</span><input type="checkbox" ${s.noUpset ? 'checked' : ''} data-setcb="noUpset"></label>
     <label class="switch"><span>Kadın, genç (U21 vb.) ve amatör maçlarını alma</span><input type="checkbox" ${s.noYouth ? 'checked' : ''} data-setcb="noYouth"></label>
   </div>
@@ -1070,6 +1101,9 @@ function onSettingsAction(t) {
     settingsDirty.regen = true;
   } else if (k === 'autoMinN') {
     s.autoMinN = Math.max(2, Math.min(s.autoMaxN, s.autoMinN + Number(t.dataset.d)));
+    settingsDirty.regen = true;
+  } else if (k === 'maxLate') {
+    s.maxLate = Math.max(0, Math.min(10, (s.maxLate ?? 3) + Number(t.dataset.d)));
     settingsDirty.regen = true;
   } else if (k === 'autoMaxN') {
     s.autoMaxN = Math.max(s.autoMinN, Math.min(10, s.autoMaxN + Number(t.dataset.d)));
@@ -1142,6 +1176,7 @@ async function applySettings() {
 function infoHtml() {
   return `
   <h3>Nasıl çalışır?</h3>
+  <p class="note"><b>Günlük kupon:</b> Kupon Türkiye saatiyle günlüktür. Gece 00:00'dan sonra oynanan maçlardan en fazla 3 tanesi kupona girer, diğerleri ertesi günün kuponuna kalır. Bütün maçların indirilmesi ve analizi günde bir kez yapılır (00:00'da ya da günün ilk açılışında) ve telefonda saklanır; gün içinde açınca hazır gelir. Üstteki yenile düğmesi analizi elle yeniden yapar.</p>
   <p class="note"><b>Gol bekle + sürpriz yok (varsayılan):</b> Alt, KG Yok, 0-0, "0-1 gol" gibi ya da ancak az gollü maçta tutan seçimler alınmaz. Kazanma ihtimali %22'nin altındaki takıma "kazanır" oynanmaz; favori maçı kazanıyorsa İY/MS 1/2 veya 2/1 serbesttir.</p>
   <p class="note"><b>Simülasyon:</b> Günün her maçı, oranlardan ve takım istatistiklerinden (puan durumu, son 10 maç, attığı/yediği goller, ilk yarı golleri) kurulan gol modeliyle 10.000 kez oynatılır. Her seçimin kaç kez tuttuğu ve kuponun bu 10.000 günde ne kazandırdığı gösterilir.</p>
   <p class="note">0. <b>Yüksek oran modu (varsayılan):</b> Günün bütün maçlarının bütün bahis seçenekleri (MS, İY/MS 1/2-2/1, maç skoru, İY skoru, kaç farkla, yarı bahisleri, MS+Alt/Üst, korner, kart…) incelenir; oranı 5-30 arasındaki her seçeneğin gerçek olasılığı hesaplanır ve 6 maçlık 3-4-5-6 sisteme (2 misli = 84 TL) en uygun 6 seçim seçilir. Kupon 10.000 kez simüle edilir.</p>
@@ -1164,7 +1199,7 @@ function render() {
 
 function statusLine() {
   const n = state.events.length;
-  return `${state.updatedAt ? `${n} maç · güncellendi ${fmtTime(state.updatedAt / 1000)}` : `${n} maç`} · v${APP_VERSION}`;
+  return `${state.updatedAt ? `${n} maç · günün analizi ${fmtTime(state.updatedAt / 1000)}` : `${n} maç`} · v${APP_VERSION}`;
 }
 
 // Drop every cached copy of the app and load it again from the server.
@@ -1201,7 +1236,7 @@ document.querySelector('.tabs').addEventListener('click', (ev) => {
   window.scrollTo({ top: 0 });
 });
 
-$('#btn-refresh').addEventListener('click', () => loadAll(true));
+$('#btn-refresh').addEventListener('click', () => loadAll(true)); // re-download and re-analyse now
 $('#btn-settings').addEventListener('click', () => openSheet(settingsHtml()));
 
 function slotPick(i) { return couponPicks()[Number(i)]; }
@@ -1474,6 +1509,17 @@ function altRow(p, slot) {
 
 // ---------- loading ----------
 let loading = false;
+let loadedDay = null;
+let midnightTimer = null;
+
+// At 00:00 (Turkey) a new day starts: download everything again and build the new day's coupon.
+function scheduleMidnight() {
+  clearTimeout(midnightTimer);
+  const ms = nextMidnight() * 1000 - Date.now() + 60e3;
+  midnightTimer = setTimeout(() => loadAll(true), Math.min(Math.max(ms, 1000), 2 ** 31 - 1));
+}
+
+// force: download and analyse again even if today's analysis is already stored on the phone.
 async function loadAll(force = false) {
   if (loading) return;
   loading = true;
@@ -1481,39 +1527,74 @@ async function loadAll(force = false) {
   btn.classList.add('spin');
   const first = state.phase !== 'ready';
   try {
-    setStatus('Bülten indiriliyor…');
-    setProgress(0.08);
-    if (first) render();
-    const [events, comps, names] = await Promise.all([
-      api.fetchEvents(), api.fetchCompetitions().catch(() => ({})), api.fetchMarketNames().catch(() => ({})),
-    ]);
-    state.comps = comps;
-    state.marketNames = names;
-    const now = Date.now() / 1000;
-    state.events = events.filter((e) => e.d > now - 60).sort((a, b) => a.d - b.d);
-    state.eventsById = new Map(state.events.map((e) => [e.i, e]));
-    state.detailed = new Set();
-    state.updatedAt = Date.now();
-    await loadDetails(state.events.filter((e) => eventEligible(e, now)));
-    if (force) {
-      // drop cached statistics older than this session only when user asks to refresh
-      for (const [id, st] of state.stats) if (!st?.ok) state.stats.delete(id);
+    const today = gameDay();
+    if (loadedDay && loadedDay !== today) {
+      // new day: yesterday's coupon is done (it stays in Geçmiş if it was saved)
+      state.coupon = null;
+      state.tempExcluded.clear();
+      state.stats = new Map();
+      state.statsExtra = new Map();
     }
-    setProgress(0.2);
-    await analyzeAll();
-    await loadStatsForTop();
+    if (first) render();
+    let cached = force ? null : await loadDay();
+    if (cached && cached.day !== today) cached = null;
+
+    if (cached) {
+      // Today's analysis already happened: reuse the stored data, no downloads.
+      setStatus('Günün analizi açılıyor…');
+      setProgress(0.3);
+      state.comps = cached.comps || {};
+      state.marketNames = cached.names || {};
+      state.events = cached.events || [];
+      state.eventsById = new Map(state.events.map((e) => [e.i, e]));
+      state.detailed = new Set(cached.detailed || []);
+      state.stats = new Map(cached.stats || []);
+      state.updatedAt = cached.savedAt;
+      await analyzeAll('Günün maçları hesaplanıyor');
+    } else {
+      setStatus('Bülten indiriliyor…');
+      setProgress(0.08);
+      const [events, comps, names] = await Promise.all([
+        api.fetchEvents(), api.fetchCompetitions().catch(() => ({})), api.fetchMarketNames().catch(() => ({})),
+      ]);
+      state.comps = comps;
+      state.marketNames = names;
+      const now = Date.now() / 1000;
+      const list = events.filter((e) => e.d > now - 60);
+      // matches of today's coupon that already started are no longer in the bulletin: keep them
+      const prev = state.eventsById;
+      for (const id of state.coupon?.ids || []) {
+        const ev = Number(String(id).split(':')[0]);
+        if (!list.some((e) => e.i === ev) && prev.has(ev)) list.push(prev.get(ev));
+      }
+      state.events = list.sort((a, b) => a.d - b.d);
+      state.eventsById = new Map(state.events.map((e) => [e.i, e]));
+      state.detailed = new Set();
+      await loadDetails(state.events.filter((e) => eventEligible(e, now)));
+      if (force) for (const [id, st] of state.stats) if (!st?.ok) state.stats.delete(id);
+      setProgress(0.25);
+      await analyzeAll();
+      await loadStatsForTop();
+      state.updatedAt = Date.now();
+      saveDay({
+        day: today, savedAt: state.updatedAt, events: state.events, comps, names,
+        detailed: [...state.detailed], stats: [...state.stats],
+      });
+    }
+    loadedDay = today;
+    scheduleMidnight();
     state.combos = null;
     if (!state.coupon) {
       if (!restoreCoupon()) await buildCoupon();
     } else {
-      // refresh: keep the user's coupon, refill slots whose markets closed
+      // refresh: keep the day's coupon, refill only slots whose markets closed
       const valid = couponPicks();
       if (valid.length < state.coupon.ids.length || valid.length < couponSys().n) await buildCoupon({ keepIds: true });
     }
     state.phase = 'ready';
     state.error = null;
     setStatus(statusLine());
-    if (force) toast('Oranlar güncellendi');
+    if (force && !first) toast('Günün analizi yenilendi');
   } catch (err) {
     console.error(err);
     if (state.phase !== 'ready') { state.phase = 'error'; }
@@ -1538,4 +1619,8 @@ render();
 checkForUpdate();
 loadAll();
 // a phone can keep the app open for days: check again whenever it comes back to the screen
-document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') checkForUpdate(); });
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible') return;
+  checkForUpdate();
+  if (loadedDay && loadedDay !== gameDay()) loadAll(true); // missed midnight while in the background
+});

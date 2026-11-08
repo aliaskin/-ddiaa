@@ -1,7 +1,7 @@
 // Coupon optimizer: chooses one pick per match so that the chosen system
 // (e.g. 3-4-5-6 with 6 matches) maximizes the selected objective.
 
-import { quickEval, evaluateSystem, columnCount } from './system.js?v=6';
+import { quickEval, evaluateSystem, columnCount } from './system.js?v=7';
 
 export const OBJECTIVES = {
   hedef: { name: 'Hedef kazanç', desc: 'Belirlediğin hedef kazanca (ör. 10.000 TL) ulaşma olasılığını en yükseğe çıkarır.', f: (r) => r.pTarget + 0.01 * (r.evRatio - 1) },
@@ -64,13 +64,16 @@ function makeScorer(sizes, misli, unit, n, objective, target = Infinity) {
   };
 }
 
-function conflicts(set, cand, skip, maxPerLeague) {
-  let league = 0;
+// maxLate: how many picks may kick off after midnight (pick.late), Infinity = no limit.
+function conflicts(set, cand, skip, maxPerLeague, maxLate = Infinity) {
+  let league = 0, late = 0;
   for (let i = 0; i < set.length; i++) {
     if (i === skip || !set[i]) continue;
     if (set[i].eventId === cand.eventId) return true;
     if (cand.league && set[i].league === cand.league) league++;
+    if (set[i].late) late++;
   }
+  if (cand.late && late >= maxLate) return true;
   return maxPerLeague > 0 && league >= maxPerLeague;
 }
 
@@ -84,6 +87,7 @@ export function optimizeSystem(pool, opts) {
   const sizes = opts.sizes.filter((k) => k <= n);
   const locked = (opts.locked || []).slice(0, n);
   const maxPerLeague = opts.maxPerLeague ?? 2;
+  const maxLate = opts.maxLate ?? Infinity;
   const score = makeScorer(sizes, opts.misli, opts.unit ?? 1, n, opts.objective, opts.target);
   const rnd = mulberry32(opts.seed ?? 1);
   const free = n - locked.length;
@@ -94,7 +98,7 @@ export function optimizeSystem(pool, opts) {
     const set = locked.slice();
     for (const c of order) {
       if (set.length >= n) break;
-      if (!conflicts(set, c, -1, maxPerLeague)) set.push(c);
+      if (!conflicts(set, c, -1, maxPerLeague, maxLate)) set.push(c);
     }
     return set.length === n ? set : null;
   };
@@ -107,7 +111,7 @@ export function optimizeSystem(pool, opts) {
       for (let i = locked.length; i < n; i++) {
         let bi = null, bs = best;
         for (const c of cand) {
-          if (c === set[i] || conflicts(set, c, i, maxPerLeague)) continue;
+          if (c === set[i] || conflicts(set, c, i, maxPerLeague, maxLate)) continue;
           const old = set[i];
           set[i] = c;
           const s = score(set);
@@ -145,7 +149,7 @@ export function optimizeSystem(pool, opts) {
       const i = locked.length + Math.floor(rnd() * free);
       for (let tries = 0; tries < 30; tries++) {
         const c = cand[Math.floor(rnd() * cand.length)];
-        if (!conflicts(set, c, i, maxPerLeague)) { set[i] = c; break; }
+        if (!conflicts(set, c, i, maxPerLeague, maxLate)) { set[i] = c; break; }
       }
     }
     const r = climb(set);
@@ -163,7 +167,7 @@ export function alternativesFor(pool, picks, slot, opts, limit = 8) {
   const set = picks.slice();
   const out = [];
   for (const c of pool) {
-    if (c.id === picks[slot].id || conflicts(set, c, slot, opts.maxPerLeague ?? 2)) continue;
+    if (c.id === picks[slot].id || conflicts(set, c, slot, opts.maxPerLeague ?? 2, opts.maxLate ?? Infinity)) continue;
     set[slot] = c;
     out.push({ pick: c, s: score(set) });
   }

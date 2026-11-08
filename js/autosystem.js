@@ -6,8 +6,8 @@
 // ~0.85-0.88 on iddaa), so small columns (2'li, 3'lü) lose far less than big ones (5'li, 6'lı).
 // Which small layout is possible depends on the day's MBS values, so the best system changes daily.
 
-import { buildPool, optimizeSystem, hashString } from './optimizer.js?v=6';
-import { columnCount } from './system.js?v=6';
+import { buildPool, optimizeSystem, hashString } from './optimizer.js?v=7';
+import { columnCount } from './system.js?v=7';
 
 // cfg: { minN, maxN, budget, minStake, unit, minSize (default 2), lockedCount, lockedMbc }
 export function systemLayouts(cfg) {
@@ -47,7 +47,7 @@ export function searchSystems(picks, cfg, opts, onProgress) {
     if (pool.length + locked.length < L.n) return null;
     const r = optimizeSystem(pool, {
       n: L.n, sizes: L.sizes, misli: L.misli, unit: L.unit, objective: opts.objective, target: opts.target,
-      locked, maxPerLeague: opts.maxPerLeague, effort,
+      locked, maxPerLeague: opts.maxPerLeague, maxLate: opts.maxLate, effort,
       seed: hashString(`${opts.seedBase}|${L.n}|${L.sizes.join(',')}`),
     });
     if (!r || r.picks.length < L.n) return null;
