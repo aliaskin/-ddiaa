@@ -1,12 +1,12 @@
-import { analyzeEvent } from './model.js';
-import { filterPicks, buildPool, optimizeSystem, alternativesFor, findTargetCombos, OBJECTIVES, hashString } from './optimizer.js';
-import { evaluateSystem, columnCount, payoutFor, simulateCoupon } from './system.js';
-import { GROUPS, settlePick } from './markets.js';
+import { analyzeEvent, cellMask } from './model.js';
+import { filterPicks, buildPool, optimizeSystem, alternativesFor, findTargetCombos, OBJECTIVES, hashString, mulberry32 } from './optimizer.js';
+import { evaluateSystem, columnCount, payoutFor } from './system.js';
+import { GROUPS, MARKETS, settlePick } from './markets.js';
 import { searchSystems } from './autosystem.js';
 import * as api from './api.js';
 
 // ---------- settings & storage ----------
-const SETTINGS_VERSION = 3;
+const SETTINGS_VERSION = 4;
 // Preset the user asked for: 6 matches, system 3-4-5-6, 2 misli = 84 TL, every pick 5+ odds,
 // optimized for the chance of winning 10.000 TL.
 const HIGH_ODDS_PRESET = {
@@ -20,6 +20,9 @@ const HIGH_ODDS_PRESET = {
   minOdd: 5,
   maxOdd: 30,
   groups: ['MS', 'AU', 'KG', 'HND', 'TAU', 'IY', 'IYMS', 'KOMBO', 'TG', 'SKOR', 'YARI', 'OZEL'],
+  // goals wanted: no unders / KG Yok / 0-0 style picks, and no "underdog wins" picks
+  goalMode: true,
+  noUpset: true,
 };
 const DEFAULTS = {
   v: SETTINGS_VERSION,
@@ -34,7 +37,7 @@ const DEFAULTS = {
   statsWeight: 0.2,
   maxPerLeague: 2,
   noYouth: true,
-  statsTop: 30,
+  statsTop: 999, // statistics for every match of the day
   target: 10,
 };
 
@@ -45,10 +48,12 @@ const store = {
 
 function loadSettings() {
   const saved = store.get('settings', {});
-  if ((saved.v || 1) < 3) {
+  if ((saved.v || 1) < SETTINGS_VERSION) {
     // v3: 5+ odds, 6 matches 3-4-5-6 with 2 misli, kral oran, 10.000 TL target
+    // v4: goal mode, no underdog wins, statistics for every match
     for (const k of Object.keys(HIGH_ODDS_PRESET)) delete saved[k];
     store.set('coupon', null);
+    delete saved.statsTop;
     const migrated = { ...DEFAULTS, ...saved, v: SETTINGS_VERSION };
     store.set('settings', migrated);
     return migrated;
@@ -69,6 +74,7 @@ const state = {
   analyses: new Map(),
   pickById: new Map(),
   stats: new Map(),
+  statsExtra: new Map(),
   updatedAt: null,
   coupon: null, // { ids: [], locked: Set, excluded: Set, sys: {n,sizes,misli,unit,cols,stake}, ranking: [] }
   tempExcluded: new Set(),
@@ -172,6 +178,7 @@ function analyzeOne(e) {
   const a = analyzeEvent(e, {
     oddField: state.settings.oddField, statsWeight: state.settings.statsWeight,
     stats: st && st.ok ? st : null, marketNames: state.marketNames, oddRange: [1.15, Infinity],
+    simRange: [state.settings.minOdd, state.settings.maxOdd], simRuns: 10000, seed: hashString(gameDay()),
   });
   if (!a) { state.analyses.delete(e.i); return; }
   for (const p of a.picks) { p.league = e.ci; p.d = e.d; }
@@ -221,7 +228,8 @@ function eligiblePicks({ maxMbc, ignoreExcluded = false } = {}) {
     all.push(...a.picks);
   }
   const excluded = new Set(ignoreExcluded ? [] : [...(state.coupon?.excluded || []), ...state.tempExcluded]);
-  return filterPicks(all, {
+  const wanted = all.filter((p) => !(s.goalMode && p.lowGoal) && !(s.noUpset && p.upset));
+  return filterPicks(wanted, {
     minOdd: s.minOdd, maxOdd: s.maxOdd, groups: new Set(s.groups),
     maxMbc: maxMbc ?? minSizeOf(couponSys()), excluded,
   });
@@ -236,27 +244,29 @@ function optOptions(locked, sys = couponSys()) {
   };
 }
 
+// Team statistics (standings, last 10 matches incl. half-time scores) for every match of the day.
 async function loadStatsForTop() {
   const s = state.settings;
   if (!(s.statsWeight > 0)) return;
-  const pool = buildPool(eligiblePicks({ maxMbc: s.sysMode === 'auto' ? 99 : undefined }), 4, 160);
-  const ids = [];
-  for (const p of pool) if (!ids.includes(p.eventId)) ids.push(p.eventId);
-  const want = ids.slice(0, s.statsTop);
+  const now = Date.now() / 1000;
+  const want = state.events.filter((e) => eventEligible(e, now)).map((e) => e.i).slice(0, s.statsTop || 999);
   for (const id of state.coupon?.ids || []) {
     const ev = Number(String(id).split(':')[0]);
     if (!want.includes(ev)) want.push(ev);
   }
   const missing = want.filter((id) => !state.stats.has(id) && state.eventsById.has(id));
   if (missing.length) {
-    await api.pool(missing, 6, async (id) => {
+    await api.pool(missing, 8, async (id) => {
       const st = await api.fetchStats(id);
       state.stats.set(id, st);
-    }, (d, n) => { setStatus(`İstatistikler yükleniyor ${d}/${n}`); setProgress(0.6 + 0.35 * (d / n)); });
+    }, (d, n) => { setStatus(`Takım istatistikleri ${d}/${n}`); setProgress(0.6 + 0.3 * (d / n)); });
   }
-  for (const id of want) {
-    const e = state.eventsById.get(id);
+  setStatus('Maçlar 10.000 kez simüle ediliyor…');
+  await tick();
+  for (let i = 0; i < want.length; i++) {
+    const e = state.eventsById.get(want[i]);
     if (e) analyzeOne(e);
+    if (i % 15 === 14) await tick();
   }
   rebuildPickIndex();
 }
@@ -426,9 +436,44 @@ function renderPick(p, i, locked) {
     <div class="pick-stats">
       <span>olasılık <b>${fmtPct(p.p, p.p < 0.2 ? 1 : 0)}</b></span>
       <span>adil oran <b>${fmtOdd(1 / p.p)}</b></span>
+      ${p.simHits !== null && p.simHits !== undefined ? `<span>10.000 simülasyonda <b>${p.simHits.toLocaleString('tr-TR')}</b> kez</span>` : ''}
       <span class="badge ${valueClass(p.v)}" title="Değer = oran × olasılık">değer ${p.v.toFixed(2)}</span>
     </div>
   </article>`;
+}
+
+// The day's simulation: in run r every match has the score it got in its own r-th simulation,
+// so the coupon is judged on the same 10.000 simulated days as the match screens.
+function simulateDay(picks, sys, target) {
+  const runs = 10000;
+  const tests = picks.map((p) => {
+    const a = state.analyses.get(p.eventId);
+    if (a?.sim && a.sim.length >= runs && !p.generic && MARKETS[p.key]) {
+      const mask = cellMask(a.cells, MARKETS[p.key].pred(p.no, p.line, { name: p.name, names: p.names }));
+      return (r) => mask[a.sim[r]] === 1;
+    }
+    const rnd = mulberry32(hashString(p.id + gameDay()));
+    const arr = new Uint8Array(runs);
+    for (let r = 0; r < runs; r++) arr[r] = rnd() < p.p ? 1 : 0;
+    return (r) => arr[r] === 1;
+  });
+  const n = picks.length;
+  const stake = columnCount(n, sys.sizes) * sys.misli * sys.unit;
+  const hits = new Array(n + 1).fill(0);
+  let profit = 0, reached = 0, sum = 0, best = 0, anyPay = 0;
+  const odds = [];
+  for (let r = 0; r < runs; r++) {
+    odds.length = 0;
+    for (let i = 0; i < n; i++) if (tests[i](r)) odds.push(picks[i].odd);
+    hits[odds.length]++;
+    const pay = payoutFor(odds, sys.sizes, sys.misli, sys.unit);
+    sum += pay;
+    if (pay > 0) anyPay++;
+    if (pay > stake) profit++;
+    if (pay >= target) reached++;
+    if (pay > best) best = pay;
+  }
+  return { runs, stake, hits, anyPay, profit, reached, avgPay: sum / runs, best, target };
 }
 
 function renderSummary(picks) {
@@ -445,7 +490,7 @@ function renderSummary(picks) {
   const lose = r.byHits.filter((b) => b.k < minK).reduce((x, b) => x + b.prob, 0);
   const totalOdd = picks.reduce((x, p) => x * p.odd, 1);
   const profitAt = r.byHits.find((b) => b.k >= minK && b.minPay > r.stake);
-  const sim = simulateCoupon(picks, sys.sizes, sys.misli, sys.unit, { runs: 10000, seed: hashString(picks.map((p) => p.id).join()), target });
+  const sim = simulateDay(picks, sys, target);
   const oneIn = (p) => (p > 0 ? `${Math.max(1, Math.round(1 / p)).toLocaleString('tr-TR')} günde 1` : '–');
   return `
   <div class="card mt12">
@@ -467,7 +512,7 @@ function renderSummary(picks) {
       Ortalama beklenen dönüş: <b>${fmtTL(r.ev)}</b> (yatırılana oranı ${fmtPct(r.evRatio)}). iddaa'nın kâr payı yüzünden bu oran uzun vadede %100'ün altında kalır.
     </div>
   </div>
-  <div class="section-title"><h2>10.000 simülasyon</h2><small>bu kuponu 10.000 gün oynasaydın</small></div>
+  <div class="section-title"><h2>Günün 10.000 simülasyonu</h2><small>bütün maçlar 10.000 kez oynandı</small></div>
   <div class="card">
     <table class="tbl">
       <tbody>
@@ -477,7 +522,7 @@ function renderSummary(picks) {
         <tr><td>En büyük kazanç</td><td class="r">${fmtTL(sim.best)}</td></tr>
       </tbody>
     </table>
-    <p class="note mt8">Her maç kendi olasılığıyla rastgele sonuçlandırıldı. Toplam yatırılan ${fmtTL(sim.stake * sim.runs)}, toplam dönen ${fmtTL(sim.avgPay * sim.runs)}.</p>
+    <p class="note mt8">Her maç kendi gol modeline göre 10.000 kez oynatıldı; her turda kupon o turun skorlarıyla değerlendirildi. Toplam yatırılan ${fmtTL(sim.stake * sim.runs)}, toplam dönen ${fmtTL(sim.avgPay * sim.runs)}.</p>
   </div>`;
 }
 
@@ -578,12 +623,18 @@ function errorBox() {
 }
 
 // ---------- rendering: matches ----------
+// The user's rules: goals wanted, no underdog wins.
+function wantedPick(p) {
+  const s = state.settings;
+  return !(s.goalMode && p.lowGoal) && !(s.noUpset && p.upset);
+}
+
 function bestPickFor(a) {
   const s = state.settings;
   const groups = new Set(s.groups);
   let best = null;
   for (const p of a.picks) {
-    if (!groups.has(p.group) || p.odd < s.minOdd || p.odd > s.maxOdd) continue;
+    if (!groups.has(p.group) || p.odd < s.minOdd || p.odd > s.maxOdd || !wantedPick(p)) continue;
     if (!best || p.v > best.v) best = p;
   }
   return best;
@@ -658,13 +709,52 @@ function statsBlock(e, st) {
     <div class="l">${pct(rh.btts, rh.games)}</div><div class="c">KG Var</div><div class="rr">${pct(ra.btts, ra.games)}</div>` : ''}
   </div>`;
   if (sd) html += `<p class="note mt8">Puan durumu: ${esc(sd.season)}</p>`;
-  if (st.h2h?.length) {
-    html += '<h4>Aralarındaki son maçlar</h4><table class="tbl">' + st.h2h.map((m) => `<tr><td class="muted small">${new Date(m.t * 1000).toLocaleDateString('tr-TR')}</td><td>${esc(m.hn)}</td><td class="r"><b>${m.hs}–${m.as}</b></td><td class="r">${esc(m.an)}</td></tr>`).join('') + '</table>';
+  const ex = state.statsExtra.get(e.i) || {};
+  if (rh?.htGames && ra?.htGames) {
+    html += `<h4>İlk yarı (son maçlar)</h4><div class="stat-grid">
+      <div class="l">${(rh.htFor / rh.htGames).toFixed(2)} / ${(rh.htAgainst / rh.htGames).toFixed(2)}</div><div class="c">İY attı / yedi</div><div class="rr">${(ra.htFor / ra.htGames).toFixed(2)} / ${(ra.htAgainst / ra.htGames).toFixed(2)}</div>
+      <div class="l">${pct(rh.htScored, rh.htGames)}</div><div class="c">İY gol oldu</div><div class="rr">${pct(ra.htScored, ra.htGames)}</div>
+      <div class="l">${pct(rh.htTotal, rh.ftTotalHt)}</div><div class="c">Gollerin İY payı</div><div class="rr">${pct(ra.htTotal, ra.ftTotalHt)}</div>
+    </div>`;
   }
-  if (st.insights?.length) {
-    html += '<h4>iddaa istatistik notları</h4>' + st.insights.map((t) => `<div class="insight">${esc(t)}</div>`).join('');
+  if (ex.h2h?.length) {
+    html += '<h4>Aralarındaki son maçlar</h4><table class="tbl">' + ex.h2h.map((m) => `<tr><td class="muted small">${new Date(m.t * 1000).toLocaleDateString('tr-TR')}</td><td>${esc(m.hn)}</td><td class="r"><b>${m.hs}–${m.as}</b></td><td class="r">${esc(m.an)}</td></tr>`).join('') + '</table>';
+  }
+  if (ex.insights?.length) {
+    html += '<h4>iddaa istatistik notları</h4>' + ex.insights.map((t) => `<div class="insight">${esc(t)}</div>`).join('');
   }
   return html;
+}
+
+// What happened when this match was played 10.000 times.
+function simSection(a) {
+  if (!a?.sim) return '';
+  const { cells, sim } = a;
+  const N = sim.length;
+  const score = new Map(), ht = [0, 0, 0];
+  let o25 = 0, btts = 0, htGoal = 0, both = 0;
+  for (let r = 0; r < N; r++) {
+    const i = sim[r];
+    const h = cells.H[i], aw = cells.A[i], h1 = cells.H1[i], a1 = cells.A1[i];
+    const k = `${h}-${aw}`;
+    score.set(k, (score.get(k) || 0) + 1);
+    ht[h1 > a1 ? 0 : h1 === a1 ? 1 : 2]++;
+    if (h + aw > 2.5) o25++;
+    if (h > 0 && aw > 0) btts++;
+    if (h1 + a1 > 0) htGoal++;
+    if (h1 + a1 > 0 && h + aw - h1 - a1 > 0) both++;
+  }
+  const top = [...score.entries()].sort((x, y) => y[1] - x[1]).slice(0, 5);
+  const c = (x) => x.toLocaleString('tr-TR');
+  return `<h4>10.000 simülasyon</h4>
+    <div class="stat-grid">
+      <div class="l">${c(htGoal)}</div><div class="c">İlk yarıda gol oldu</div><div class="rr">%${Math.round((htGoal / N) * 100)}</div>
+      <div class="l">${c(both)}</div><div class="c">İki yarıda da gol</div><div class="rr">%${Math.round((both / N) * 100)}</div>
+      <div class="l">${c(o25)}</div><div class="c">2.5 Üst</div><div class="rr">%${Math.round((o25 / N) * 100)}</div>
+      <div class="l">${c(btts)}</div><div class="c">KG Var</div><div class="rr">%${Math.round((btts / N) * 100)}</div>
+      <div class="l">${c(ht[0])} / ${c(ht[1])} / ${c(ht[2])}</div><div class="c">İY 1 / 0 / 2</div><div class="rr"></div>
+    </div>
+    <p class="note mt8">En sık skorlar: ${top.map(([k, v]) => `<b>${k}</b> (${c(v)})`).join(' · ')}</p>`;
 }
 
 function matchSheetHtml(eventId) {
@@ -685,7 +775,8 @@ function matchSheetHtml(eventId) {
       <div class="kpi"><div class="k">2.5 Üst · KG</div><div class="v" style="font-size:15px">${fmtPct(pr.over25)} · ${fmtPct(pr.btts)}</div></div>
       <div class="kpi"><div class="k">Beklenen gol</div><div class="v" style="font-size:15px">${a.lh.toFixed(2)} – ${a.la.toFixed(2)}</div></div>
     </div>
-    <p class="note mt8">Oranlardan hesaplandı (ort. kâr payı ${fmtPct(a.margin, 0)}).${a.stats ? ` İstatistiğe göre ${a.stats.lh.toFixed(2)} – ${a.stats.la.toFixed(2)} gol; %${Math.round(a.statsWeight * 100)} ağırlıkla düzeltilmiş beklenti ${a.stats.blend.lh.toFixed(2)} – ${a.stats.blend.la.toFixed(2)}.` : ''}</p>`;
+    <p class="note mt8">Oranlardan hesaplandı (ort. kâr payı ${fmtPct(a.margin, 0)}).${a.stats?.blend ? ` İstatistikle düzeltilmiş beklenti ${a.stats.blend.lh.toFixed(2)} – ${a.stats.blend.la.toFixed(2)} gol, gollerin %${Math.round(a.stats.blend.half * 100)}'i ilk yarıda.` : ''}</p>
+    ${simSection(a)}`;
   }
   html += `<h4>İstatistikler</h4><div id="stats-slot">${statsBlock(e, state.stats.get(eventId))}</div>`;
   if (a) {
@@ -718,6 +809,9 @@ async function openMatch(eventId) {
   if (!state.stats.has(eventId)) {
     jobs.push(api.fetchStats(eventId).then((st) => state.stats.set(eventId, st)).catch(() => state.stats.set(eventId, { ok: false })));
   }
+  if (!state.statsExtra.has(eventId)) {
+    jobs.push(api.fetchStatsExtra(eventId).then((x) => state.statsExtra.set(eventId, x)).catch(() => state.statsExtra.set(eventId, { h2h: [], insights: [] })));
+  }
   if (!jobs.length) return;
   await Promise.all(jobs);
   if (e) { analyzeOne(e); rebuildPickIndex(); }
@@ -737,7 +831,7 @@ function computeCombos() {
   for (const a of state.analyses.values()) {
     const e = state.eventsById.get(a.eventId);
     if (!e || !eventEligible(e)) continue;
-    for (const p of a.picks) if (groups.has(p.group) && (p.mbc ?? 1) <= 4 && p.odd >= 1.15 && p.p >= 0.08) wide.push(p);
+    for (const p of a.picks) if (groups.has(p.group) && (p.mbc ?? 1) <= 4 && p.odd >= 1.15 && p.p >= 0.08 && wantedPick(p)) wide.push(p);
   }
   state.combos = findTargetCombos(wide.length ? wide : picks, { target: s.target, ks: [2, 3, 4], top: 4 });
 }
@@ -917,6 +1011,8 @@ function settingsHtml() {
     <div class="seg">${[[1, '1'], [2, '2'], [3, '3'], [0, 'Sınırsız']].map(([k, l]) => `<button class="${s.maxPerLeague === k ? 'on' : ''}" data-set="maxPerLeague" data-v="${k}">${l}</button>`).join('')}</div>
   </div>
   <div class="field">
+    <label class="switch"><span>Gol bekle: Alt, KG Yok, 0-0 gibi az gollü seçimleri alma</span><input type="checkbox" ${s.goalMode ? 'checked' : ''} data-setcb="goalMode"></label>
+    <label class="switch"><span>Sürpriz galibiyet oynama (kazanma ihtimali %22'nin altındaki takıma "kazanır" yok; İY/MS 1/2 – 2/1 favori kazanıyorsa serbest)</span><input type="checkbox" ${s.noUpset ? 'checked' : ''} data-setcb="noUpset"></label>
     <label class="switch"><span>Kadın, genç (U21 vb.) ve amatör maçlarını alma</span><input type="checkbox" ${s.noYouth ? 'checked' : ''} data-setcb="noYouth"></label>
   </div>
   <div class="btn-row mt16">
@@ -1013,6 +1109,8 @@ async function applySettings() {
 function infoHtml() {
   return `
   <h3>Nasıl çalışır?</h3>
+  <p class="note"><b>Gol bekle + sürpriz yok (varsayılan):</b> Alt, KG Yok, 0-0, "0-1 gol" gibi ya da ancak az gollü maçta tutan seçimler alınmaz. Kazanma ihtimali %22'nin altındaki takıma "kazanır" oynanmaz; favori maçı kazanıyorsa İY/MS 1/2 veya 2/1 serbesttir.</p>
+  <p class="note"><b>Simülasyon:</b> Günün her maçı, oranlardan ve takım istatistiklerinden (puan durumu, son 10 maç, attığı/yediği goller, ilk yarı golleri) kurulan gol modeliyle 10.000 kez oynatılır. Her seçimin kaç kez tuttuğu ve kuponun bu 10.000 günde ne kazandırdığı gösterilir.</p>
   <p class="note">0. <b>Yüksek oran modu (varsayılan):</b> Günün bütün maçlarının bütün bahis seçenekleri (MS, İY/MS 1/2-2/1, maç skoru, İY skoru, kaç farkla, yarı bahisleri, MS+Alt/Üst, korner, kart…) incelenir; oranı 5-30 arasındaki her seçeneğin gerçek olasılığı hesaplanır ve 6 maçlık 3-4-5-6 sisteme (2 misli = 84 TL) en uygun 6 seçim seçilir. Kupon 10.000 kez simüle edilir.</p>
   <p class="note"><b>İY/MS 1/2 – 2/1 hakkında:</b> Bunlar her gün değerlendirilir, ama iddaa'nın en yüksek kâr payını koyduğu bahislerdir (1 TL'ye ortalama ~0.60 TL döner; MS ve skor kombinlerinde ~0.85-0.90). Bu yüzden ancak gerçekten en iyisiyse kupona girer. Sadece İY/MS istiyorsan kupon ekranındaki "İY/MS" kısayolunu seç.</p>
   <p class="note">1. <b>Veri:</b> Bülten ve oranlar iddaa.com'dan canlı çekilir. İstatistikler (puan durumu, son 10 maç, aralarındaki maçlar, iddaa istatistik notları) iddaa istatistik servisinden gelir.</p>
@@ -1228,7 +1326,7 @@ function onAction(ev) {
       openSheet(`<h3>Yerine ne koyalım?</h3>
         <p class="note">Şu an: ${esc(curE?.hn)} – ${esc(curE?.an)} · <b>${esc(cur.label)}</b> (${fmtOdd(cur.odd)})</p>
         <h4>Aynı maçta diğer seçenekler</h4>
-        ${(state.analyses.get(cur.eventId)?.picks || []).filter((p) => p.id !== cur.id && p.odd >= s.minOdd && p.odd <= s.maxOdd && (p.mbc ?? 1) <= minSizeOf(couponSys()) && s.groups.includes(p.group)).sort((a, b) => b.v - a.v).slice(0, 5).map((p) => altRow(p, i)).join('') || '<p class="note">Yok</p>'}
+        ${(state.analyses.get(cur.eventId)?.picks || []).filter((p) => p.id !== cur.id && p.odd >= s.minOdd && p.odd <= s.maxOdd && (p.mbc ?? 1) <= minSizeOf(couponSys()) && s.groups.includes(p.group) && wantedPick(p)).sort((a, b) => b.v - a.v).slice(0, 5).map((p) => altRow(p, i)).join('') || '<p class="note">Yok</p>'}
         <h4>Başka maçlar (kupona en iyi uyanlar)</h4>
         ${alts.map((a) => altRow(a.pick, i)).join('') || '<p class="note">Uygun alternatif yok</p>'}`);
       break;

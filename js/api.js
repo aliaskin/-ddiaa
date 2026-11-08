@@ -86,6 +86,8 @@ function summarizeRecent(d, side) {
   const team = side === 'h' ? d.h?.n : d.a?.n;
   const list = [];
   let gf = 0, ga = 0, w = 0, dr = 0, l = 0, over25 = 0, btts = 0, games = 0;
+  // first-half numbers (only for matches where the side is known and the HT score exists)
+  let htGames = 0, htFor = 0, htAgainst = 0, htTotal = 0, ftTotalHt = 0, htScored = 0;
   for (const m of d.m.slice(0, 10)) {
     const hs = Number(m.h?.rs), as = Number(m.a?.rs);
     if (!Number.isFinite(hs) || !Number.isFinite(as)) continue;
@@ -100,10 +102,16 @@ function summarizeRecent(d, side) {
     if (f > g) w++; else if (f === g) dr++; else l++;
     if (hs + as > 2.5) over25++;
     if (hs > 0 && as > 0) btts++;
+    const h1 = Number(m.h?.fhs), a1 = Number(m.a?.fhs);
+    if (mine && Number.isFinite(h1) && Number.isFinite(a1)) {
+      const f1 = mine === 'h' ? h1 : a1, g1 = mine === 'h' ? a1 : h1;
+      htGames++; htFor += f1; htAgainst += g1; htTotal += h1 + a1; ftTotalHt += hs + as;
+      if (h1 + a1 > 0) htScored++;
+    }
     list.push({ t: m.t, hn: m.h?.n, an: m.a?.n, hs, as, hs1: m.h?.fhs, as1: m.a?.fhs, r: f > g ? 'G' : f === g ? 'B' : 'M', lg: m.l?.a || m.l?.n });
   }
   if (!games) return null;
-  return { team, games, gf, ga, w, d: dr, l, over25, btts, list };
+  return { team, games, gf, ga, w, d: dr, l, over25, btts, htGames, htFor, htAgainst, htTotal, ftTotalHt, htScored, list };
 }
 
 function trimStandings(d) {
@@ -116,27 +124,42 @@ function trimStandings(d) {
   return { homeId: String(d.shi), awayId: String(d.sai), season: d.ss?.n || '', rows };
 }
 
+// Core statistics used by the model (standings + last 10 matches of each team), for every match.
 export async function fetchStats(eventId) {
-  const key = `st:${eventId}`;
+  const key = `st2:${eventId}`;
   const cached = cacheGet(key, 4 * 3600e3);
   if (cached) return cached;
   const safe = (p) => p.catch(() => null);
-  const [st, r0, r1, h2h, bi] = await Promise.all([
+  const [st, r0, r1] = await Promise.all([
     safe(getJson(`${ST}/soccer/standings/${eventId}?standingType=1&isLive=false`)),
     safe(getJson(`${ST}/soccer/recent-matches/${eventId}?matchHistoryType=0&isOnlyCurrentTournament=false`)),
     safe(getJson(`${ST}/soccer/recent-matches/${eventId}?matchHistoryType=1&isOnlyCurrentTournament=false`)),
-    safe(getJson(`${ST}/soccer/recent-matches/${eventId}?matchHistoryType=2&isOnlyCurrentTournament=false`)),
-    safe(getJson(`${ST}/soccer/bet-insights/${eventId}`)),
   ]);
   const out = {
     standings: trimStandings(st),
     recentHome: summarizeRecent(r0, 'h'),
     recentAway: summarizeRecent(r1, 'a'),
-    h2h: (h2h?.m || []).slice(0, 6).map((m) => ({ t: m.t, hn: m.h?.n, an: m.a?.n, hs: m.h?.rs, as: m.a?.rs })),
-    insights: (bi?.bi || []).map((b) => b.f).filter(Boolean).slice(0, 8),
   };
   out.ok = !!(out.standings || out.recentHome || out.recentAway);
   if (out.ok) cacheSet(key, out);
+  return out;
+}
+
+// Extra details shown on the match screen: head-to-head and iddaa's statistic notes.
+export async function fetchStatsExtra(eventId) {
+  const key = `sx:${eventId}`;
+  const cached = cacheGet(key, 4 * 3600e3);
+  if (cached) return cached;
+  const safe = (p) => p.catch(() => null);
+  const [h2h, bi] = await Promise.all([
+    safe(getJson(`${ST}/soccer/recent-matches/${eventId}?matchHistoryType=2&isOnlyCurrentTournament=false`)),
+    safe(getJson(`${ST}/soccer/bet-insights/${eventId}`)),
+  ]);
+  const out = {
+    h2h: (h2h?.m || []).slice(0, 6).map((m) => ({ t: m.t, hn: m.h?.n, an: m.a?.n, hs: m.h?.rs, as: m.a?.rs, hs1: m.h?.fhs, as1: m.a?.fhs })),
+    insights: (bi?.bi || []).map((b) => b.f).filter(Boolean).slice(0, 8),
+  };
+  cacheSet(key, out);
   return out;
 }
 

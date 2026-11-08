@@ -266,6 +266,54 @@ export function jointCells(lh, la, rho, f) {
   return cells;
 }
 
+// Probability of a pick plus what the score looks like when it wins:
+// expected total goals and how often the home / away team wins the match.
+export function probDetail(cells, pred) {
+  const s = { h: 0, a: 0, h1: 0, a1: 0 };
+  let p = 0, goals = 0, home = 0, away = 0;
+  for (let i = 0; i < cells.n; i++) {
+    s.h = cells.H[i]; s.a = cells.A[i]; s.h1 = cells.H1[i]; s.a1 = cells.A1[i];
+    if (!pred(s)) continue;
+    const q = cells.P[i];
+    p += q; goals += q * (s.h + s.a);
+    if (s.h > s.a) home += q; else if (s.a > s.h) away += q;
+  }
+  return { p, goals: p > 0 ? goals / p : 0, home: p > 0 ? home / p : 0, away: p > 0 ? away / p : 0 };
+}
+
+// Play a match N times: returns the index of the simulated score cell for each run.
+export function simulateMatch(cells, runs, seed) {
+  const cum = new Float64Array(cells.n);
+  let c = 0;
+  for (let i = 0; i < cells.n; i++) { c += cells.P[i]; cum[i] = c; }
+  let a = seed >>> 0;
+  const out = new Int32Array(runs);
+  for (let r = 0; r < runs; r++) {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    const u = (((t ^ (t >>> 14)) >>> 0) / 4294967296) * c;
+    let lo = 0, hi = cells.n - 1;
+    while (lo < hi) { const mid = (lo + hi) >> 1; if (cum[mid] < u) lo = mid + 1; else hi = mid; }
+    out[r] = lo;
+  }
+  return out;
+}
+
+export function cellMask(cells, pred) {
+  const m = new Uint8Array(cells.n);
+  const s = { h: 0, a: 0, h1: 0, a1: 0 };
+  for (let i = 0; i < cells.n; i++) {
+    s.h = cells.H[i]; s.a = cells.A[i]; s.h1 = cells.H1[i]; s.a1 = cells.A1[i];
+    if (pred(s)) m[i] = 1;
+  }
+  return m;
+}
+
+// "Az gollü" picks: unders, KG Yok, 0-0 ... (the user wants goals)
+const LOW_GOAL_LABEL = /\bAlt\b|\bYok\b|0-1 gol|Skor 0-0|İY Skor 0-0|Gol Olmaz/i;
+
 export function probOf(cells, pred) {
   const s = { h: 0, a: 0, h1: 0, a1: 0 };
   let p = 0;
@@ -316,11 +364,18 @@ export function statsLambdas(stats) {
     parts.push({ lh, la, w: 0.8 });
     detail.recent = { lh, la };
   }
-  if (!parts.length) return null;
+  // share of goals scored before half-time in both teams' recent matches (shrunk to the usual 0.445)
+  let half = null;
+  if (rh && ra && (rh.htGames || 0) + (ra.htGames || 0) >= 6) {
+    const ht = (rh.htTotal || 0) + (ra.htTotal || 0), ft = (rh.ftTotalHt || 0) + (ra.ftTotalHt || 0);
+    half = Math.max(0.36, Math.min(0.52, (ht + 0.445 * 8) / (ft + 8)));
+    detail.half = half;
+  }
+  if (!parts.length) return half === null ? null : { lh: null, la: null, half, detail };
   const ws = parts.reduce((s, p) => s + p.w, 0);
   const lh = Math.exp(parts.reduce((s, p) => s + p.w * Math.log(p.lh), 0) / ws);
   const la = Math.exp(parts.reduce((s, p) => s + p.w * Math.log(p.la), 0) / ws);
-  return { lh: clampL(lh), la: clampL(la), detail };
+  return { lh: clampL(lh), la: clampL(la), half, detail };
 }
 
 function clampL(x) { return Math.max(0.15, Math.min(4.5, x)); }
@@ -331,6 +386,8 @@ export function analyzeEvent(event, opts = {}) {
   const oddField = opts.oddField || 'odd';
   const markets = normalizeMarkets(event, oddField, opts.marketNames);
   const [loOdd, hiOdd] = opts.oddRange || [1.0, Infinity];
+  const [simLo, simHi] = opts.simRange || [5, 40];
+  const runs = opts.simRuns ?? 10000;
   if (!markets.find((m) => m.key === '1_1')) return null;
   const targets = buildTargets(markets);
   if (targets.ft.length < 1) return null;
@@ -338,19 +395,27 @@ export function analyzeEvent(event, opts = {}) {
   const f = fitHalf(targets.ht, fit.lh, fit.la, fit.rho);
   const cellsMkt = jointCells(fit.lh, fit.la, fit.rho, f);
 
+  // Team statistics nudge the expected goals and the first-half goal share (geometric blend);
+  // they do not override the market. Mixing raw stats probabilities directly would inflate long shots.
   let sl = null, cellsStats = null;
   const w = opts.stats ? (opts.statsWeight ?? 0.2) : 0;
   if (w > 0) {
     sl = statsLambdas(opts.stats);
-    // Statistics nudge the expected goals (geometric blend); they do not override the market.
-    // Mixing raw stats probabilities in directly would hugely inflate long shots.
     if (sl) {
-      const lhB = Math.exp((1 - w) * Math.log(fit.lh) + w * Math.log(sl.lh));
-      const laB = Math.exp((1 - w) * Math.log(fit.la) + w * Math.log(sl.la));
-      sl.blend = { lh: lhB, la: laB };
-      cellsStats = jointCells(lhB, laB, fit.rho, f);
+      const lhB = sl.lh ? Math.exp((1 - w) * Math.log(fit.lh) + w * Math.log(sl.lh)) : fit.lh;
+      const laB = sl.la ? Math.exp((1 - w) * Math.log(fit.la) + w * Math.log(sl.la)) : fit.la;
+      const fB = sl.half ? (1 - w) * f + w * sl.half : f;
+      sl.blend = { lh: lhB, la: laB, half: fB };
+      cellsStats = jointCells(lhB, laB, fit.rho, fB);
     }
   }
+  const cells = cellsStats || cellsMkt;
+  // Simulate the match (10.000 times by default); picks in the odds range get their hit counts.
+  const sim = runs > 0 ? simulateMatch(cells, runs, (event.i * 2654435761) ^ (opts.seed || 0)) : null;
+  const meanGoals = probDetail(cells, () => true).goals;
+  const pHome = probDetail(cells, (x) => x.h > x.a).p;
+  const pAway = probDetail(cells, (x) => x.a > x.h).p;
+  const upsetLimit = opts.upsetLimit ?? 0.22;
 
   const picks = [];
   for (const mk of markets) {
@@ -362,17 +427,32 @@ export function analyzeEvent(event, opts = {}) {
       if (o.odd < loOdd || o.odd > hiOdd) return;
       const ctx = { name: o.name, names: mk.names };
       const pFair = mk.fair ? mk.fair[i] : null;
-      let pModel = null, pStats = null, p;
+      const label = pickLabel(mk.def, mk.line, o.no, ctx);
+      let pModel = null, pStats = null, p, simHits = null, upset = false, goalsIfWin = null;
+      // generic labels contain the market name (e.g. "Alt/Üst"), so only look at the outcome there
+      let lowGoal = mk.def.generic ? /^(Alt|Yok|Hayır)$/i.test(String(o.name).trim()) : LOW_GOAL_LABEL.test(label);
       if (mk.def.generic) {
         // corners, cards, ...: no goal model, use the market's own margin-free price
         p = pFair;
       } else {
         const pred = mk.def.pred(o.no, mk.line, ctx);
         pModel = probOf(cellsMkt, pred);
-        if (cellsStats) pStats = probOf(cellsStats, pred);
-        const pGoal = pStats ?? pModel;
+        const d = probDetail(cells, pred);
+        if (cellsStats) pStats = d.p;
+        const pGoal = d.p;
         // consensus: goal model fitted on all markets, mixed with this market's own fair price
         p = pFair === null ? pGoal : 0.5 * pGoal + 0.5 * pFair;
+        goalsIfWin = d.goals;
+        // a pick that only wins in low-scoring games counts as "az gollü"
+        if (d.goals < meanGoals - 0.9) lowGoal = true;
+        // a pick that needs a clear underdog to win the match
+        if ((d.home > 0.95 && pHome < upsetLimit) || (d.away > 0.95 && pAway < upsetLimit)) upset = true;
+        if (sim && o.odd >= simLo && o.odd <= simHi) {
+          const mask = cellMask(cells, pred);
+          let hits = 0;
+          for (let r = 0; r < sim.length; r++) hits += mask[sim[r]];
+          simHits = hits;
+        }
       }
       if (!(p > 0)) return;
       const named = mk.def.named;
@@ -384,9 +464,9 @@ export function analyzeEvent(event, opts = {}) {
         group: mk.def.group,
         market: mk.def.name,
         generic: !!mk.def.generic,
-        label: pickLabel(mk.def, mk.line, o.no, ctx),
+        label,
         odd: o.odd,
-        p, pModel, pFair, pStats,
+        p, pModel, pFair, pStats, simHits, goalsIfWin, lowGoal, upset,
         v: p * o.odd,
         mbc: mk.mbc,
         margin: mk.margin ?? null,
@@ -407,6 +487,8 @@ export function analyzeEvent(event, opts = {}) {
     margin: targets.margin, nMarkets: markets.length,
     stats: sl, statsWeight: cellsStats ? w : 0,
     probs: summary(P), probsStats: summary(PS),
+    meanGoals, pHome, pAway,
+    cells, sim, runs: sim ? sim.length : 0,
     picks,
   };
 }

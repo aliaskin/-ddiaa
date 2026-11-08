@@ -5,6 +5,8 @@ iddaa bülteninden her gün 3-4-5-6 gibi sistem kuponları oluşturan, telefona 
 ## Ne yapar?
 
 - **Kupon (varsayılan: yüksek oran modu):** Günün bütün maçlarının bütün bahis seçenekleri (MS, İY/MS, maç skoru, İY skoru, kaç farkla, yarı bahisleri, MS+Alt/Üst, MS+KG, korner, kart…) incelenir; oranı 5–30 arasındaki her seçeneğin gerçek olasılığı hesaplanır ve 6 maçlık **3-4-5-6 sistem, 2 misli = 84 TL** kupona en uygun 6 seçim konur. Hedef: belirlenen kazanca (varsayılan 10.000 TL) ulaşma olasılığını en yükseğe çıkarmak. Her sonucun (3, 4, 5, 6 tutma) olasılığı ve kazancı gösterilir, kupon 10.000 kez simüle edilir. Kral oranlar (iddaa.com'da taç işaretli olanlar) kullanılır. Ayarlardan otomatik sistem arama (bütçeye sığan en iyi sistem) ya da başka oran aralıkları seçilebilir.
+- **Kurallar (varsayılan açık):** *Gol bekle* — Alt, KG Yok, 0-0, "0-1 gol" gibi ya da ancak az gollü maçta tutan seçimler alınmaz. *Sürpriz galibiyet yok* — kazanma ihtimali %22'nin altındaki takıma "kazanır" oynanmaz; favori maçı kazanıyorsa İY/MS 1/2 veya 2/1 serbest.
+- **Günün simülasyonu:** Her maç, oranlar + takım istatistikleri (puan durumu, son 10 maç, attığı/yediği goller, ilk yarı golleri) ile kurulan gol modeliyle 10.000 kez oynatılır. Her seçimin kaç kez tuttuğu, maçın en sık skorları ve kuponun bu 10.000 günde ne kazandırdığı gösterilir.
 - **Maçlar:** Bültendeki tüm futbol maçları, her maç için modelin olasılıkları, tüm oranlar, form, puan durumu, son 10 maç, aralarındaki maçlar ve iddaa istatistik notları.
 - **10 Oran:** Toplam oranı hedefe (varsayılan 10) yakın 2, 3 ve 4 maçlık kombinasyonları, tutma olasılığına göre sıralar.
 - **Geçmiş:** Oynadığın kuponları kaydeder, sonuçları otomatik kontrol eder, net kâr/zararı tutar.
