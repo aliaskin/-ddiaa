@@ -6,7 +6,7 @@
 //    and blend it in.
 // Every pick then gets one consistent probability from the same score distribution.
 
-import { MARKETS, normalizeMarkets, pickId, pickLabel } from './markets.js?v=5';
+import { MARKETS, normalizeMarkets, pickId, pickLabel } from './markets.js?v=6';
 
 const G = 10; // full-time goals grid 0..G per team
 const GH = 6; // per-half goals grid 0..GH per team
@@ -461,7 +461,7 @@ export function analyzeEvent(event, opts = {}) {
         eventId: event.i,
         key: mk.key, line: mk.line, no: o.no,
         name: o.name, names: named ? mk.names : undefined,
-        group: mk.def.group,
+        group: mk.key === '2_90' && (o.no === 3 || o.no === 7) ? 'DONUS' : mk.def.group,
         market: mk.def.name,
         generic: !!mk.def.generic,
         label,

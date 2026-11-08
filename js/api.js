@@ -87,7 +87,7 @@ function summarizeRecent(d, side) {
   const list = [];
   let gf = 0, ga = 0, w = 0, dr = 0, l = 0, over25 = 0, btts = 0, games = 0;
   // first-half numbers (only for matches where the side is known and the HT score exists)
-  let htGames = 0, htFor = 0, htAgainst = 0, htTotal = 0, ftTotalHt = 0, htScored = 0;
+  let htGames = 0, htFor = 0, htAgainst = 0, htTotal = 0, ftTotalHt = 0, htScored = 0, comeback = 0, blown = 0;
   for (const m of d.m.slice(0, 10)) {
     const hs = Number(m.h?.rs), as = Number(m.a?.rs);
     if (!Number.isFinite(hs) || !Number.isFinite(as)) continue;
@@ -107,11 +107,13 @@ function summarizeRecent(d, side) {
       const f1 = mine === 'h' ? h1 : a1, g1 = mine === 'h' ? a1 : h1;
       htGames++; htFor += f1; htAgainst += g1; htTotal += h1 + a1; ftTotalHt += hs + as;
       if (h1 + a1 > 0) htScored++;
+      if (f1 < g1 && f > g) comeback++; // behind at half-time, won
+      if (f1 > g1 && f < g) blown++; // ahead at half-time, lost
     }
     list.push({ t: m.t, hn: m.h?.n, an: m.a?.n, hs, as, hs1: m.h?.fhs, as1: m.a?.fhs, r: f > g ? 'G' : f === g ? 'B' : 'M', lg: m.l?.a || m.l?.n });
   }
   if (!games) return null;
-  return { team, games, gf, ga, w, d: dr, l, over25, btts, htGames, htFor, htAgainst, htTotal, ftTotalHt, htScored, list };
+  return { team, games, gf, ga, w, d: dr, l, over25, btts, htGames, htFor, htAgainst, htTotal, ftTotalHt, htScored, comeback, blown, list };
 }
 
 function trimStandings(d) {
@@ -126,7 +128,7 @@ function trimStandings(d) {
 
 // Core statistics used by the model (standings + last 10 matches of each team), for every match.
 export async function fetchStats(eventId) {
-  const key = `st2:${eventId}`;
+  const key = `st3:${eventId}`;
   const cached = cacheGet(key, 4 * 3600e3);
   if (cached) return cached;
   const safe = (p) => p.catch(() => null);

@@ -6,8 +6,8 @@
 // ~0.85-0.88 on iddaa), so small columns (2'li, 3'lü) lose far less than big ones (5'li, 6'lı).
 // Which small layout is possible depends on the day's MBS values, so the best system changes daily.
 
-import { buildPool, optimizeSystem, hashString } from './optimizer.js?v=5';
-import { columnCount } from './system.js?v=5';
+import { buildPool, optimizeSystem, hashString } from './optimizer.js?v=6';
+import { columnCount } from './system.js?v=6';
 
 // cfg: { minN, maxN, budget, minStake, unit, minSize (default 2), lockedCount, lockedMbc }
 export function systemLayouts(cfg) {

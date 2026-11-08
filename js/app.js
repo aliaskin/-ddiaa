@@ -1,17 +1,19 @@
-import { analyzeEvent, cellMask } from './model.js?v=5';
-import { filterPicks, buildPool, optimizeSystem, alternativesFor, findTargetCombos, OBJECTIVES, hashString, mulberry32 } from './optimizer.js?v=5';
-import { evaluateSystem, columnCount, payoutFor } from './system.js?v=5';
-import { GROUPS, MARKETS, settlePick } from './markets.js?v=5';
-import { searchSystems } from './autosystem.js?v=5';
-import * as api from './api.js?v=5';
+import { analyzeEvent, cellMask } from './model.js?v=6';
+import { filterPicks, buildPool, optimizeSystem, alternativesFor, findTargetCombos, OBJECTIVES, hashString, mulberry32 } from './optimizer.js?v=6';
+import { evaluateSystem, columnCount, payoutFor } from './system.js?v=6';
+import { GROUPS, MARKETS, settlePick } from './markets.js?v=6';
+import { searchSystems } from './autosystem.js?v=6';
+import * as api from './api.js?v=6';
 
 // Bump together with version.json on every release: an older copy on the phone reloads itself.
-const APP_VERSION = 5;
+const APP_VERSION = 6;
 
 // ---------- settings & storage ----------
-const SETTINGS_VERSION = 4;
+const SETTINGS_VERSION = 5;
 // Preset the user asked for: 6 matches, system 3-4-5-6, 2 misli = 84 TL, every pick 5+ odds,
 // optimized for the chance of winning 10.000 TL.
+// Every goal-based bet type (used for "Hepsi" and to complete a coupon when the chosen type is short).
+const ALL_GOAL_GROUPS = ['DONUS', 'MS', 'AU', 'KG', 'HND', 'TAU', 'IY', 'IYMS', 'KOMBO', 'TG', 'SKOR', 'YARI', 'OZEL'];
 const HIGH_ODDS_PRESET = {
   sysMode: 'manual',
   n: 6,
@@ -21,8 +23,9 @@ const HIGH_ODDS_PRESET = {
   targetWin: 10000,
   oddField: 'odd',
   minOdd: 5,
-  maxOdd: 30,
-  groups: ['MS', 'AU', 'KG', 'HND', 'TAU', 'IY', 'IYMS', 'KOMBO', 'TG', 'SKOR', 'YARI', 'OZEL'],
+  maxOdd: 60,
+  // v5: the user wants İY/MS 1/2 and 2/1 (most likely ones first)
+  groups: ['DONUS'],
   // goals wanted: no unders / KG Yok / 0-0 style picks, and no "underdog wins" picks
   goalMode: true,
   noUpset: true,
@@ -54,6 +57,7 @@ function loadSettings() {
   if ((saved.v || 1) < SETTINGS_VERSION) {
     // v3: 5+ odds, 6 matches 3-4-5-6 with 2 misli, kral oran, 10.000 TL target
     // v4: goal mode, no underdog wins, statistics for every match
+    // v5: İY/MS 1/2 – 2/1 coupon by default, odds up to 60
     for (const k of Object.keys(HIGH_ODDS_PRESET)) delete saved[k];
     store.set('coupon', null);
     delete saved.statsTop;
@@ -221,7 +225,7 @@ function couponSys() {
 }
 const minSizeOf = (sys) => Math.min(...sys.sizes);
 
-function eligiblePicks({ maxMbc, ignoreExcluded = false } = {}) {
+function eligiblePicks({ maxMbc, ignoreExcluded = false, groups = null } = {}) {
   const s = state.settings;
   const now = Date.now() / 1000;
   const all = [];
@@ -233,8 +237,9 @@ function eligiblePicks({ maxMbc, ignoreExcluded = false } = {}) {
   const excluded = new Set(ignoreExcluded ? [] : [...(state.coupon?.excluded || []), ...state.tempExcluded]);
   const wanted = all.filter((p) => !(s.goalMode && p.lowGoal) && !(s.noUpset && p.upset));
   return filterPicks(wanted, {
-    minOdd: s.minOdd, maxOdd: s.maxOdd, groups: new Set(s.groups),
+    minOdd: s.minOdd, maxOdd: s.maxOdd, groups: new Set(groups || s.groups),
     maxMbc: maxMbc ?? minSizeOf(couponSys()), excluded,
+    minProb: 0.01, // İY/MS 1/2 – 2/1 are usually 2-4 %
   });
 }
 
@@ -316,8 +321,22 @@ function lockedFrom(prev, keepIds) {
 // Fill the coupon for a fixed system layout (manual mode, or refilling an auto coupon).
 function fillCoupon(sys, { keepIds = false } = {}) {
   const prev = state.coupon || { ids: [], locked: new Set(), excluded: new Set() };
-  const lockedPicks = lockedFrom(prev, keepIds).filter((p) => (p.mbc ?? 1) <= minSizeOf(sys)).slice(0, sys.n);
-  const pool = buildPool(eligiblePicks({ maxMbc: minSizeOf(sys) }), 4, 160);
+  let lockedPicks = lockedFrom(prev, keepIds).filter((p) => (p.mbc ?? 1) <= minSizeOf(sys)).slice(0, sys.n);
+  let pool = buildPool(eligiblePicks({ maxMbc: minSizeOf(sys) }), 4, 160);
+  const lockedEvents = new Set(lockedPicks.map((p) => p.eventId));
+  const poolEvents = new Set(pool.map((p) => p.eventId).filter((id) => !lockedEvents.has(id)));
+  if (lockedPicks.length + poolEvents.size < sys.n && !sameSet(state.settings.groups, ALL_GOAL_GROUPS)) {
+    // Not enough matches offer the chosen bet type today: take the most likely one per match,
+    // then complete the coupon with the most suitable high-odds goal bets.
+    const bestPer = new Map();
+    for (const p of pool) {
+      if (lockedEvents.has(p.eventId)) continue;
+      const cur = bestPer.get(p.eventId);
+      if (!cur || p.p > cur.p) bestPer.set(p.eventId, p);
+    }
+    lockedPicks = lockedPicks.concat([...bestPer.values()].sort((a, b) => b.p - a.p)).slice(0, sys.n);
+    pool = buildPool(eligiblePicks({ maxMbc: minSizeOf(sys), groups: ALL_GOAL_GROUPS }), 4, 160);
+  }
   const r = optimizeSystem(pool, optOptions(lockedPicks, sys));
   const base = { locked: prev.locked, excluded: prev.excluded, sys, ranking: prev.ranking || null };
   if (!r) {
@@ -555,8 +574,9 @@ function renderRanking() {
 }
 
 const QUICK_GROUPS = [
-  ['Hepsi', HIGH_ODDS_PRESET.groups],
-  ['İY/MS', ['IYMS']],
+  ['İY/MS 1/2 – 2/1', ['DONUS']],
+  ['Hepsi', ALL_GOAL_GROUPS],
+  ['Tüm İY/MS', ['DONUS', 'IYMS']],
   ['Maç sonucu', ['MS', 'HND']],
   ['Skor', ['SKOR']],
   ['Gol & kombine', ['AU', 'KG', 'TAU', 'KOMBO', 'TG']],
@@ -602,6 +622,11 @@ function renderKupon() {
     const mins = Math.round((first - Date.now() / 1000) / 60);
     const cls = mins < 30 ? 'warnbox' : 'note box';
     body += `<div class="${cls}" style="margin-bottom:8px">İlk maç ${fmtTime(first)}${mins < 120 ? ` (${mins} dk sonra)` : ''} — kuponu bu saatten önce oynamalısın.</div>`;
+  }
+  const own = picks.filter((p) => s.groups.includes(p.group)).length;
+  if (picks.length && own < picks.length) {
+    const names = s.groups.map((g) => GROUPS[g] || g).join(', ');
+    body += `<div class="note box" style="margin-bottom:8px">Bugünkü bültende <b>${esc(names)}</b> sunulan uygun maç sayısı ${own}. iddaa bu bahsi genelde büyük liglerde açıyor. Kalan ${picks.length - own} maç, en yüksek ihtimalli yüksek oranlı gol bahisleriyle tamamlandı.</div>`;
   }
   body += picks.map((p, i) => renderPick(p, i, locked.has(p.id))).join('');
   if (picks.length >= minSizeOf(couponSys())) body += renderSummary(picks);
@@ -718,6 +743,9 @@ function statsBlock(e, st) {
       <div class="l">${(rh.htFor / rh.htGames).toFixed(2)} / ${(rh.htAgainst / rh.htGames).toFixed(2)}</div><div class="c">İY attı / yedi</div><div class="rr">${(ra.htFor / ra.htGames).toFixed(2)} / ${(ra.htAgainst / ra.htGames).toFixed(2)}</div>
       <div class="l">${pct(rh.htScored, rh.htGames)}</div><div class="c">İY gol oldu</div><div class="rr">${pct(ra.htScored, ra.htGames)}</div>
       <div class="l">${pct(rh.htTotal, rh.ftTotalHt)}</div><div class="c">Gollerin İY payı</div><div class="rr">${pct(ra.htTotal, ra.ftTotalHt)}</div>
+      ${rh.comeback !== undefined && ra.comeback !== undefined ? `
+      <div class="l">${rh.comeback}/${rh.htGames}</div><div class="c">İY geride → kazandı</div><div class="rr">${ra.comeback}/${ra.htGames}</div>
+      <div class="l">${rh.blown}/${rh.htGames}</div><div class="c">İY önde → kaybetti</div><div class="rr">${ra.blown}/${ra.htGames}</div>` : ''}
     </div>`;
   }
   if (ex.h2h?.length) {
@@ -1177,6 +1205,13 @@ $('#btn-refresh').addEventListener('click', () => loadAll(true));
 $('#btn-settings').addEventListener('click', () => openSheet(settingsHtml()));
 
 function slotPick(i) { return couponPicks()[Number(i)]; }
+// Alternatives come from the chosen bet types, or from all goal bets for a filler slot.
+function slotPool(p) {
+  const s = state.settings;
+  const own = buildPool(eligiblePicks(), 4, 160);
+  if (p && s.groups.includes(p.group) && own.length >= 3) return own;
+  return buildPool(eligiblePicks({ groups: ALL_GOAL_GROUPS }), 4, 160);
+}
 
 function replaceSlot(i, newPick) {
   const ids = state.coupon.ids.slice();
@@ -1338,7 +1373,7 @@ function onAction(ev) {
       if (!p) break;
       state.coupon.excluded.add(p.eventId);
       state.coupon.locked.delete(p.id);
-      const pool = buildPool(eligiblePicks(), 4, 160);
+      const pool = slotPool(p);
       const alts = alternativesFor(pool, couponPicks(), Number(t.dataset.i), optOptions([]), 1);
       if (alts.length) replaceSlot(Number(t.dataset.i), alts[0].pick);
       else { state.coupon.ids.splice(Number(t.dataset.i), 1); saveCoupon(); }
@@ -1348,7 +1383,7 @@ function onAction(ev) {
     }
     case 'swap': {
       const i = Number(t.dataset.i);
-      const pool = buildPool(eligiblePicks(), 4, 160);
+      const pool = slotPool(slotPick(i));
       const alts = alternativesFor(pool, couponPicks(), i, optOptions([]), 10);
       const cur = slotPick(i);
       const curE = state.eventsById.get(cur.eventId);

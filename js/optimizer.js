@@ -1,7 +1,7 @@
 // Coupon optimizer: chooses one pick per match so that the chosen system
 // (e.g. 3-4-5-6 with 6 matches) maximizes the selected objective.
 
-import { quickEval, evaluateSystem, columnCount } from './system.js?v=5';
+import { quickEval, evaluateSystem, columnCount } from './system.js?v=6';
 
 export const OBJECTIVES = {
   hedef: { name: 'Hedef kazanç', desc: 'Belirlediğin hedef kazanca (ör. 10.000 TL) ulaşma olasılığını en yükseğe çıkarır.', f: (r) => r.pTarget + 0.01 * (r.evRatio - 1) },
