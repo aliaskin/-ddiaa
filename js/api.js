@@ -182,8 +182,18 @@ export async function pool(items, limit, fn, onProgress) {
 }
 
 // ---------- results (for history) ----------
-// Looks the finished match up in the home team's recent matches.
+// 1) The live match card has the score as soon as the match ends (st 6 = full time;
+//    sr = regular-time score, sfh = first-half score).
+// 2) Fallback: the finished match in the recent-matches lists (home team, away team, head-to-head).
 export async function fetchResult(eventId, kickoff, homeName) {
+  const num = (x) => (Number.isFinite(Number(x)) && x !== null && x !== undefined ? Number(x) : null);
+  try {
+    const d = await getJson(`${ST}/soccer/match-card/${eventId}?isLive=true`);
+    if (d && d.st === 6) {
+      const h = num(d.h?.sr ?? d.h?.sc), a = num(d.a?.sr ?? d.a?.sc);
+      if (h !== null && a !== null) return { h, a, h1: num(d.h?.sfh), a1: num(d.a?.sfh) };
+    }
+  } catch { /* try the lists */ }
   const tryType = async (type) => {
     const d = await getJson(`${ST}/soccer/recent-matches/${eventId}?matchHistoryType=${type}&isOnlyCurrentTournament=false`);
     for (const m of d?.m || []) {
@@ -198,7 +208,13 @@ export async function fetchResult(eventId, kickoff, homeName) {
     }
     return null;
   };
-  return (await tryType(0)) || (await tryType(2)) || null;
+  for (const type of [0, 1, 2]) {
+    try {
+      const r = await tryType(type);
+      if (r) return r;
+    } catch { /* next list */ }
+  }
+  return null;
 }
 
 export function iddaaMatchUrl(eventId) {
