@@ -284,7 +284,8 @@ export function normalizeMarkets(event, oddField = 'odd', marketNames = null) {
       if (!(odd > 1.0)) { complete = false; continue; }
       outcomes.push({ no: o.no, odd, name: o.n });
     }
-    if (outcomes.length < 2) continue;
+    // goal markets can be priced by the score model even when one side is closed (odd 1.00)
+    if (outcomes.length < (def ? 1 : 2)) continue;
     complete = complete && outcomes.length === (m.o || []).length;
     if (!def) {
       // only clean partitions can be de-vigged on their own
