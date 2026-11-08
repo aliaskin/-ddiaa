@@ -77,30 +77,43 @@ export function evaluateSystem(picks, sizes, misli = 1, unit = 1) {
 }
 
 // Fast objective evaluation (no per-hit table), used inside the optimizer.
+// Depth-first over hit/miss of each pick, updating the symmetric polynomials incrementally,
+// and skipping branches that can no longer reach the smallest column size (they pay 0).
+const stackCache = new Map();
 export function quickEval(ps, os, sizes, stake, misliUnit) {
   const n = ps.length;
   const minK = Math.min(...sizes);
+  let st = stackCache.get(n);
+  if (!st) { st = Array.from({ length: n + 1 }, () => new Float64Array(n + 1)); stackCache.set(n, st); }
+  st[0].fill(0); st[0][0] = 1;
+  const nS = sizes.length;
   let ev = 0, pProfit = 0, pBig = 0, pGood = 0;
-  const total = 1 << n;
-  const e = new Float64Array(n + 1);
-  for (let mask = 0; mask < total; mask++) {
-    let prob = 1, c = 0;
-    e.fill(0); e[0] = 1;
-    for (let i = 0; i < n; i++) {
-      if (mask & (1 << i)) {
-        prob *= ps[i]; c++;
-        const x = os[i];
-        for (let k = c; k >= 1; k--) e[k] += e[k - 1] * x;
-      } else prob *= 1 - ps[i];
+  const good = stake * GOOD, big = stake * 10;
+  const rec = (i, c, prob) => {
+    if (c + (n - i) < minK) return;
+    if (i === n) {
+      const e = st[n];
+      let pay = 0;
+      for (let j = 0; j < nS; j++) { const k = sizes[j]; if (k <= c) pay += e[k]; }
+      pay *= misliUnit;
+      ev += prob * pay;
+      if (pay > stake) pProfit += prob;
+      if (pay >= good) pGood += prob;
+      if (pay >= big) pBig += prob;
+      return;
     }
-    if (c < minK) continue;
-    let pay = 0;
-    for (const k of sizes) if (k <= c) pay += e[k];
-    pay *= misliUnit;
-    ev += prob * pay;
-    if (pay > stake) pProfit += prob;
-    if (pay >= stake * GOOD) pGood += prob;
-    if (pay >= stake * 10) pBig += prob;
-  }
+    const cur = st[i], nxt = st[i + 1];
+    // hit
+    const x = os[i];
+    nxt[0] = 1;
+    for (let k = 1; k <= c + 1; k++) nxt[k] = cur[k] + cur[k - 1] * x;
+    for (let k = c + 2; k <= n; k++) nxt[k] = 0;
+    rec(i + 1, c + 1, prob * ps[i]);
+    // miss
+    for (let k = 0; k <= c; k++) nxt[k] = cur[k];
+    for (let k = c + 1; k <= n; k++) nxt[k] = 0;
+    rec(i + 1, c, prob * (1 - ps[i]));
+  };
+  rec(0, 0, 1);
   return { ev, evRatio: ev / stake, pProfit, pGood, pBig };
 }

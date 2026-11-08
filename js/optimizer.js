@@ -4,9 +4,9 @@
 import { quickEval, evaluateSystem, columnCount } from './system.js';
 
 export const OBJECTIVES = {
-  kar: { name: 'Kâr şansı (önerilen)', desc: 'Kuponun en az %25 kârla bitme olasılığını en yükseğe çıkarır.', f: (r) => r.pGood + 0.5 * (r.evRatio - 1) },
+  kar: { name: 'Kâr şansı (önerilen)', desc: 'Kuponun en az %25 kârla bitme olasılığını en yükseğe çıkarır.', f: (r) => r.pGood + 1.0 * (r.evRatio - 1) },
   deger: { name: 'Beklenen getiri', desc: 'Uzun vadede TL başına beklenen dönüşü en yükseğe çıkarır.', f: (r) => r.evRatio + 0.1 * r.pProfit },
-  buyuk: { name: 'Büyük vurgun', desc: 'Yatırılanın en az 10 katı kazanma olasılığını en yükseğe çıkarır.', f: (r) => r.pBig + 0.3 * (r.evRatio - 1) },
+  buyuk: { name: 'Büyük vurgun', desc: 'Yatırılanın en az 10 katı kazanma olasılığını en yükseğe çıkarır.', f: (r) => r.pBig + 0.1 * (r.evRatio - 1) },
 };
 
 export function mulberry32(seed) {
@@ -74,8 +74,12 @@ function conflicts(set, cand, skip, maxPerLeague) {
   return maxPerLeague > 0 && league >= maxPerLeague;
 }
 
-// opts: { n, sizes, misli, unit, objective, locked:[pick], seed, maxPerLeague }
+// opts: { n, sizes, misli, unit, objective, locked:[pick], seed, maxPerLeague, effort: 'light'|'medium'|'full' }
 export function optimizeSystem(pool, opts) {
+  const effort = opts.effort || 'full';
+  const randomStarts = effort === 'light' ? 0 : effort === 'medium' ? 2 : 4;
+  const ilsRounds = effort === 'light' ? 0 : effort === 'medium' ? 3 : 8;
+  const maxPasses = effort === 'light' ? 3 : 25;
   const n = opts.n;
   const sizes = opts.sizes.filter((k) => k <= n);
   const locked = (opts.locked || []).slice(0, n);
@@ -98,7 +102,7 @@ export function optimizeSystem(pool, opts) {
   const climb = (set) => {
     let best = score(set);
     let improved = true, guard = 0;
-    while (improved && guard++ < 25) {
+    while (improved && guard++ < maxPasses) {
       improved = false;
       for (let i = locked.length; i < n; i++) {
         let bi = null, bs = best;
@@ -122,8 +126,8 @@ export function optimizeSystem(pool, opts) {
   if (s0) starts.push(s0);
   // value-ordered start restricted to a typical odds band
   const mid = fill(cand.filter((c) => c.odd >= 1.7 && c.odd <= 2.5).concat(cand));
-  if (mid) starts.push(mid);
-  for (let r = 0; r < 4; r++) {
+  if (mid && effort !== 'light') starts.push(mid);
+  for (let r = 0; r < randomStarts; r++) {
     const top = cand.slice(0, Math.min(cand.length, 60));
     const shuffled = top.map((c) => [rnd(), c]).sort((a, b) => a[0] - b[0]).map((x) => x[1]);
     const s = fill(shuffled.concat(cand));
@@ -135,7 +139,7 @@ export function optimizeSystem(pool, opts) {
     if (!best || r.s > best.s) best = { set: r.set.slice(), s: r.s };
   }
   // iterated local search: perturb two free slots and climb again
-  for (let it = 0; it < 8 && free >= 2; it++) {
+  for (let it = 0; it < ilsRounds && free >= 2; it++) {
     const set = best.set.slice();
     for (let j = 0; j < 2; j++) {
       const i = locked.length + Math.floor(rnd() * free);

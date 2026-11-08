@@ -2,19 +2,28 @@ import { analyzeEvent } from './model.js';
 import { filterPicks, buildPool, optimizeSystem, alternativesFor, findTargetCombos, OBJECTIVES, hashString } from './optimizer.js';
 import { evaluateSystem, columnCount, payoutFor } from './system.js';
 import { GROUPS, settlePick } from './markets.js';
+import { searchSystems } from './autosystem.js';
 import * as api from './api.js';
 
 // ---------- settings & storage ----------
+const SETTINGS_VERSION = 2;
 const DEFAULTS = {
+  v: SETTINGS_VERSION,
+  // system: 'auto' searches every layout within the budget, 'manual' uses n/sizes/misli below
+  sysMode: 'auto',
+  budget: 84,
+  autoMinN: 5,
+  autoMaxN: 8,
+  minStake: 50,
   n: 6,
   sizes: [3, 4, 5, 6],
   misli: 2,
   unit: 1,
   objective: 'kar',
   oddField: 'wodd',
-  minOdd: 1.3,
-  maxOdd: 3.0,
-  groups: ['MS', 'CS', 'AU', 'KG', 'HND', 'TAU'],
+  minOdd: 2.0,
+  maxOdd: 5.0,
+  groups: ['MS', 'CS', 'AU', 'KG', 'HND', 'TAU', 'IY', 'KOMBO'],
   window: 'today',
   statsWeight: 0.2,
   maxPerLeague: 2,
@@ -28,8 +37,21 @@ const store = {
   set(k, v) { try { localStorage.setItem('sk:' + k, JSON.stringify(v)); } catch { /* storage blocked */ } },
 };
 
+function loadSettings() {
+  const saved = store.get('settings', {});
+  if ((saved.v || 1) < 2) {
+    // v2: high odds only + automatic system search by default
+    for (const k of ['minOdd', 'maxOdd', 'groups', 'objective']) delete saved[k];
+    store.set('coupon', null);
+    const migrated = { ...DEFAULTS, ...saved, v: SETTINGS_VERSION };
+    store.set('settings', migrated);
+    return migrated;
+  }
+  return { ...DEFAULTS, ...saved, v: SETTINGS_VERSION };
+}
+
 const state = {
-  settings: { ...DEFAULTS, ...store.get('settings', {}) },
+  settings: loadSettings(),
   tab: store.get('tab', 'kupon'),
   phase: 'loading', // loading | ready | error
   error: null,
@@ -40,7 +62,7 @@ const state = {
   pickById: new Map(),
   stats: new Map(),
   updatedAt: null,
-  coupon: null, // { ids: [], locked: Set, excluded: Set }
+  coupon: null, // { ids: [], locked: Set, excluded: Set, sys: {n,sizes,misli,unit,cols,stake}, ranking: [] }
   tempExcluded: new Set(),
   matchFilter: { q: '', day: 'all', sort: 'time' },
   history: store.get('history', []),
@@ -166,6 +188,18 @@ function eventEligible(e, now = Date.now() / 1000) {
   return true;
 }
 
+function manualSys() {
+  const s = state.settings;
+  const sizes = s.sizes.filter((k) => k <= s.n);
+  const cols = columnCount(s.n, sizes);
+  return { n: s.n, sizes, misli: s.misli, unit: s.unit, cols, stake: cols * s.misli * s.unit };
+}
+// The system the current coupon is played with (auto mode stores the layout it found).
+function couponSys() {
+  return state.coupon?.sys || manualSys();
+}
+const minSizeOf = (sys) => Math.min(...sys.sizes);
+
 function eligiblePicks({ maxMbc, ignoreExcluded = false } = {}) {
   const s = state.settings;
   const now = Date.now() / 1000;
@@ -178,23 +212,23 @@ function eligiblePicks({ maxMbc, ignoreExcluded = false } = {}) {
   const excluded = new Set(ignoreExcluded ? [] : [...(state.coupon?.excluded || []), ...state.tempExcluded]);
   return filterPicks(all, {
     minOdd: s.minOdd, maxOdd: s.maxOdd, groups: new Set(s.groups),
-    maxMbc: maxMbc ?? Math.min(...s.sizes), excluded,
+    maxMbc: maxMbc ?? minSizeOf(couponSys()), excluded,
   });
 }
 
-function optOptions(locked) {
+function optOptions(locked, sys = couponSys()) {
   const s = state.settings;
   return {
-    n: s.n, sizes: s.sizes, misli: s.misli, unit: s.unit, objective: s.objective,
+    n: sys.n, sizes: sys.sizes, misli: sys.misli, unit: sys.unit, objective: s.objective,
     locked, maxPerLeague: s.maxPerLeague,
-    seed: hashString(`${gameDay()}|${s.objective}|${s.n}|${s.sizes.join(',')}`),
+    seed: hashString(`${gameDay()}|${s.objective}|${sys.n}|${sys.sizes.join(',')}`),
   };
 }
 
 async function loadStatsForTop() {
   const s = state.settings;
   if (!(s.statsWeight > 0)) return;
-  const pool = buildPool(eligiblePicks(), 4, 160);
+  const pool = buildPool(eligiblePicks({ maxMbc: s.sysMode === 'auto' ? 99 : undefined }), 4, 160);
   const ids = [];
   for (const p of pool) if (!ids.includes(p.eventId)) ids.push(p.eventId);
   const want = ids.slice(0, s.statsTop);
@@ -230,49 +264,102 @@ function saveCoupon() {
   store.set('coupon', {
     day: gameDay(), ids: state.coupon.ids,
     locked: [...state.coupon.locked], excluded: [...state.coupon.excluded],
+    sys: state.coupon.sys || null, ranking: state.coupon.ranking || null,
   });
 }
 
-function generateCoupon({ keepIds = false } = {}) {
-  const s = state.settings;
-  const prev = state.coupon || { ids: [], locked: new Set(), excluded: new Set() };
-  const minSize = Math.min(...s.sizes);
-  let lockedPicks = prev.ids.filter((id) => prev.locked.has(id) || keepIds).map((id) => state.pickById.get(id)).filter(Boolean)
-    .filter((p) => (p.mbc ?? 1) <= minSize);
+function lockedFrom(prev, keepIds) {
   const now = Date.now() / 1000;
-  lockedPicks = lockedPicks.filter((p) => p.d > now + 120).slice(0, s.n);
-  const pool = buildPool(eligiblePicks(), 4, 160);
-  const r = optimizeSystem(pool, optOptions(lockedPicks));
+  return prev.ids.filter((id) => prev.locked.has(id) || keepIds)
+    .map((id) => state.pickById.get(id)).filter(Boolean)
+    .filter((p) => p.d > now + 120);
+}
+
+// Fill the coupon for a fixed system layout (manual mode, or refilling an auto coupon).
+function fillCoupon(sys, { keepIds = false } = {}) {
+  const prev = state.coupon || { ids: [], locked: new Set(), excluded: new Set() };
+  const lockedPicks = lockedFrom(prev, keepIds).filter((p) => (p.mbc ?? 1) <= minSizeOf(sys)).slice(0, sys.n);
+  const pool = buildPool(eligiblePicks({ maxMbc: minSizeOf(sys) }), 4, 160);
+  const r = optimizeSystem(pool, optOptions(lockedPicks, sys));
+  const base = { locked: prev.locked, excluded: prev.excluded, sys, ranking: prev.ranking || null };
   if (!r) {
-    state.coupon = { ids: lockedPicks.map((p) => p.id), locked: prev.locked, excluded: prev.excluded };
+    state.coupon = { ...base, ids: lockedPicks.map((p) => p.id) };
+    saveCoupon();
+    return false;
+  }
+  state.coupon = { ...base, ids: r.picks.map((p) => p.id), locked: new Set([...prev.locked].filter((id) => r.picks.some((p) => p.id === id))) };
+  saveCoupon();
+  return true;
+}
+
+// Build a fresh coupon: in auto mode this searches every system layout within the budget.
+async function buildCoupon({ keepIds = false } = {}) {
+  const s = state.settings;
+  if (s.sysMode !== 'auto') { state.coupon && (state.coupon.ranking = null); return fillCoupon(manualSys(), { keepIds }); }
+  if (keepIds && state.coupon?.sys) return fillCoupon(state.coupon.sys, { keepIds });
+  const prev = state.coupon || { ids: [], locked: new Set(), excluded: new Set() };
+  const locked = lockedFrom(prev, false);
+  setStatus('En iyi sistem aranıyor…');
+  setProgress(0.97);
+  await tick();
+  const picks = eligiblePicks({ maxMbc: 99 });
+  for (const p of locked) if (!picks.includes(p)) picks.push(p);
+  const res = searchSystems(picks, {
+    minN: s.autoMinN, maxN: s.autoMaxN, budget: s.budget, minStake: s.minStake, unit: s.unit,
+  }, { objective: s.objective, locked, maxPerLeague: s.maxPerLeague, seedBase: `${gameDay()}|${s.objective}` });
+  setProgress(null);
+  setStatus(statusLine());
+  const best = res.ranking[0];
+  if (!best) {
+    state.coupon = { ids: locked.map((p) => p.id), locked: prev.locked, excluded: prev.excluded, sys: null, ranking: [] };
     saveCoupon();
     return false;
   }
   state.coupon = {
-    ids: r.picks.map((p) => p.id),
-    locked: new Set([...prev.locked].filter((id) => r.picks.some((p) => p.id === id))),
+    ids: best.ids.slice(),
+    locked: new Set([...prev.locked].filter((id) => best.ids.includes(id))),
     excluded: prev.excluded,
+    sys: best.sys,
+    ranking: res.ranking.slice(0, 6).map((r) => ({ sys: r.sys, ids: r.ids, m: r.metrics })),
   };
   saveCoupon();
   return true;
 }
 
+function useRanking(i) {
+  const r = state.coupon?.ranking?.[i];
+  if (!r) return;
+  const missing = r.ids.some((id) => !state.pickById.has(id));
+  state.coupon.sys = r.sys;
+  state.coupon.ids = r.ids.filter((id) => state.pickById.has(id));
+  state.coupon.locked = new Set([...state.coupon.locked].filter((id) => r.ids.includes(id)));
+  if (missing) fillCoupon(r.sys, { keepIds: true }); else saveCoupon();
+}
+
 function restoreCoupon() {
   const saved = store.get('coupon', null);
   if (!saved || saved.day !== gameDay()) return false;
-  state.coupon = { ids: saved.ids || [], locked: new Set(saved.locked || []), excluded: new Set(saved.excluded || []) };
+  if (state.settings.sysMode === 'auto' && !saved.sys) return false;
+  state.coupon = {
+    ids: saved.ids || [], locked: new Set(saved.locked || []), excluded: new Set(saved.excluded || []),
+    sys: state.settings.sysMode === 'auto' ? saved.sys : manualSys(), ranking: saved.ranking || null,
+  };
   const valid = couponPicks();
-  if (valid.length === state.settings.n && valid.length === state.coupon.ids.length) return true;
+  if (valid.length === couponSys().n && valid.length === state.coupon.ids.length) return true;
   // some picks are gone (market closed / match started): keep the rest and refill
-  generateCoupon({ keepIds: true });
+  fillCoupon(couponSys(), { keepIds: true });
   return true;
 }
 
+function sysName(sys) {
+  return sys.sizes.length === 1 ? `${li(sys.sizes[0])}` : sizesLabel(sys.sizes);
+}
+
 function couponText() {
-  const s = state.settings;
+  const sys = couponSys();
   const picks = couponPicks();
-  const r = evaluateSystem(picks, s.sizes, s.misli, s.unit);
-  const lines = [`Sistem ${sizesLabel(r.sizes)} · ${picks.length} maç · ${s.misli} misli · ${fmtTL(r.stake)} (${r.columns} kolon)`];
+  const r = evaluateSystem(picks, sys.sizes, sys.misli, sys.unit);
+  const lines = [`Sistem ${sysName(sys)} · ${picks.length} maç · ${sys.misli} misli · ${fmtTL(r.stake)} (${r.columns} kolon)`];
   picks.forEach((p, i) => {
     const e = state.eventsById.get(p.eventId);
     lines.push(`${i + 1}) ${fmtTime(p.d)} ${e ? `${e.hn} - ${e.an}` : ''} → ${p.label} (${fmtOdd(p.odd)})`);
@@ -317,8 +404,8 @@ function renderPick(p, i, locked) {
 }
 
 function renderSummary(picks) {
-  const s = state.settings;
-  const r = evaluateSystem(picks, s.sizes, s.misli, s.unit);
+  const sys = couponSys();
+  const r = evaluateSystem(picks, sys.sizes, sys.misli, sys.unit);
   const minK = Math.min(...r.sizes);
   const rows = r.byHits.filter((b) => b.k >= minK).map((b) => {
     const pay = b.minPay === b.maxPay ? fmtTL(b.minPay) : `${fmtTL(b.minPay)} – ${fmtTL(b.maxPay)}`;
@@ -326,12 +413,13 @@ function renderSummary(picks) {
   }).join('');
   const lose = r.byHits.filter((b) => b.k < minK).reduce((x, b) => x + b.prob, 0);
   const totalOdd = picks.reduce((x, p) => x * p.odd, 1);
+  const profitAt = r.byHits.find((b) => b.k >= minK && b.minPay > r.stake);
   return `
   <div class="card mt12">
     <div class="kpis k2">
       <div class="kpi"><div class="k">Kâra geçme olasılığı</div><div class="v ${r.pProfit >= 0.2 ? 'good' : 'warn'}">${fmtPct(r.pProfit, 1)}</div></div>
       <div class="kpi"><div class="k">En az %25 kâr</div><div class="v">${fmtPct(r.pGood, 1)}</div></div>
-      <div class="kpi"><div class="k">Para dönme (${minK}+ tutma)</div><div class="v">${fmtPct(r.pReturn, 0)}</div></div>
+      <div class="kpi"><div class="k">Kâr için</div><div class="v">${profitAt ? `${profitAt.k}/${picks.length} tutmalı` : '–'}</div></div>
       <div class="kpi"><div class="k">Maks. kazanç</div><div class="v">${fmtTL(r.maxPay)}</div></div>
     </div>
     <table class="tbl mt12">
@@ -342,21 +430,48 @@ function renderSummary(picks) {
       </tbody>
     </table>
     <div class="note box mt12">
-      ${r.columns} kolon × ${s.misli} misli × ${fmtTL(s.unit)} = <b>${fmtTL(r.stake)}</b> · Toplam oran (hepsi): ${fmtOdd(totalOdd)}<br>
+      ${r.columns} kolon × ${sys.misli} misli × ${fmtTL(sys.unit)} = <b>${fmtTL(r.stake)}</b> · Ortalama oran ${fmtOdd(picks.reduce((x, p) => x + p.odd, 0) / picks.length)} · Hepsinin çarpımı ${fmtOdd(totalOdd)}<br>
       Ortalama beklenen dönüş: <b>${fmtTL(r.ev)}</b> (yatırılana oranı ${fmtPct(r.evRatio)}). iddaa'nın kâr payı yüzünden bu oran uzun vadede %100'ün altında kalır.
     </div>
   </div>`;
 }
 
+// Comparison of the best system layouts found by the automatic search.
+function renderRanking() {
+  const list = state.coupon?.ranking;
+  if (state.settings.sysMode !== 'auto' || !list?.length) return '';
+  const cur = couponSys();
+  const same = (a) => a.n === cur.n && a.sizes.join() === cur.sizes.join();
+  return `
+  <div class="section-title"><h2>Sistem karşılaştırması</h2><small>bütçe ${fmtTL(state.settings.budget)}</small></div>
+  <div class="card">
+    <table class="tbl">
+      <thead><tr><th>Sistem</th><th class="r">Kâr</th><th class="r">Getiri</th><th class="r">Maks.</th><th></th></tr></thead>
+      <tbody>${list.map((r, i) => `
+        <tr class="${same(r.sys) ? 'hl' : ''}">
+          <td><b>${r.sys.n} maç · ${esc(sysName(r.sys))}</b><div class="small muted">${r.sys.cols} kolon × ${r.sys.misli} misli = ${fmtTL(r.sys.stake)}</div></td>
+          <td class="r">${fmtPct(r.m.pProfit)}</td>
+          <td class="r">${fmtPct(r.m.evRatio)}</td>
+          <td class="r">${fmtTL(r.m.maxPay)}</td>
+          <td class="r">${same(r.sys) ? '<span class="badge good">seçili</span>' : `<button class="btn sm" data-act="use-sys" data-i="${i}">Seç</button>`}</td>
+        </tr>`).join('')}
+      </tbody>
+    </table>
+    <p class="note mt8">Kâr: kâra geçme olasılığı · Getiri: 1 TL'ye beklenen dönüş. Küçük kolonlu sistemler (2'li, 3'lü) her gün en yüksek getiriyi verir; 2'li kolon için maçların MBS'si en fazla 2 olmalı.</p>
+  </div>`;
+}
+
 function renderKupon() {
   const s = state.settings;
-  const cols = columnCount(s.n, s.sizes.filter((k) => k <= s.n));
-  const stake = cols * s.misli * s.unit;
+  const sys = state.phase === 'ready' && state.coupon?.sys ? state.coupon.sys : (s.sysMode === 'auto' ? null : manualSys());
   const head = `
   <div class="card hero">
     <div>
-      <div class="cfg">${s.n} maç · Sistem ${sizesLabel(s.sizes)} · ${s.misli} misli · ${cols} kolon</div>
-      <div class="cost">${fmtTL(stake).replace(' TL', '')}<small>TL</small></div>
+      ${sys
+    ? `<div class="cfg">${s.sysMode === 'auto' ? '<span class="badge good">Otomatik</span> ' : ''}${sys.n} maç · Sistem ${esc(sysName(sys))} · ${sys.misli} misli · ${sys.cols} kolon</div>
+         <div class="cost">${fmtTL(sys.stake).replace(' TL', '')}<small>TL</small></div>`
+    : `<div class="cfg"><span class="badge good">Otomatik</span> ${s.autoMinN}-${s.autoMaxN} maç · oran ${fmtOdd(s.minOdd)}–${fmtOdd(s.maxOdd)}</div>
+         <div class="cost">≤${fmtTL(s.budget).replace(' TL', '')}<small>TL</small></div>`}
     </div>
     <button class="btn sm" data-act="settings"><svg><use href="#i-gear"/></svg>Ayarla</button>
   </div>
@@ -370,9 +485,10 @@ function renderKupon() {
 
   const picks = couponPicks();
   const locked = state.coupon?.locked || new Set();
+  const need = couponSys().n;
   let body = '';
-  if (picks.length < s.n) {
-    body = `<div class="warnbox mt12">Ayarlarına uyan yeterli maç bulunamadı (${picks.length}/${s.n}). Oran aralığını, pazarları ya da zaman aralığını genişletmeyi dene.</div>`;
+  if (!picks.length || picks.length < need) {
+    body = `<div class="warnbox mt12">Ayarlarına uyan yeterli maç bulunamadı (${picks.length}/${need}). Oran aralığını, bahis türlerini ya da maç zamanını genişletmeyi dene.</div>`;
   }
   body += `<div class="section-title"><h2>Günün kuponu</h2><small>${dayLabel(Date.now() / 1000)} · ${state.updatedAt ? 'oranlar ' + fmtTime(state.updatedAt / 1000) : ''}</small></div>`;
   if (picks.length) {
@@ -382,7 +498,8 @@ function renderKupon() {
     body += `<div class="${cls}" style="margin-bottom:8px">İlk maç ${fmtTime(first)}${mins < 120 ? ` (${mins} dk sonra)` : ''} — kuponu bu saatten önce oynamalısın.</div>`;
   }
   body += picks.map((p, i) => renderPick(p, i, locked.has(p.id))).join('');
-  if (picks.length >= Math.min(...s.sizes)) body += renderSummary(picks);
+  if (picks.length >= minSizeOf(couponSys())) body += renderSummary(picks);
+  body += renderRanking();
   body += `
   <div class="btn-row mt12">
     <button class="btn" data-act="regen"><svg><use href="#i-refresh"/></svg>En iyisi</button>
@@ -677,8 +794,25 @@ async function checkResults() {
 function settingsHtml() {
   const s = state.settings;
   const cols = columnCount(s.n, s.sizes.filter((k) => k <= s.n));
+  const auto = s.sysMode === 'auto';
   return `
   <h3>Ayarlar</h3>
+  <div class="field">
+    <span class="lbl">Sistem seçimi</span>
+    <div class="seg">${[['auto', 'Otomatik (en iyisi)'], ['manual', 'Elle']].map(([k, l]) => `<button class="${s.sysMode === k ? 'on' : ''}" data-set="sysMode" data-v="${k}">${l}</button>`).join('')}</div>
+    <div class="hint">${auto ? 'Bütçene sığan tüm sistemler (maç sayısı × 2\'li/3\'lü/… kolonlar) tek tek denenir, en iyisi seçilir.' : 'Maç sayısını, sistemi ve misliyi sen belirlersin.'}</div>
+  </div>
+  ${auto ? `
+  <div class="two">
+    <div class="field"><label for="f-budget">Bütçe (TL)</label><input id="f-budget" class="inp" type="number" inputmode="decimal" min="1" step="1" value="${s.budget}" data-setin="budget"></div>
+    <div class="field"><label for="f-minstake">Asgari kupon bedeli</label><input id="f-minstake" class="inp" type="number" inputmode="decimal" min="0" step="1" value="${s.minStake}" data-setin="minStake"></div>
+  </div>
+  <div class="two">
+    <div class="field"><span class="lbl">En az maç</span>
+      <div class="stepper"><button data-set="autoMinN" data-d="-1">−</button><input value="${s.autoMinN}" readonly aria-label="En az maç"><button data-set="autoMinN" data-d="1">+</button></div></div>
+    <div class="field"><span class="lbl">En çok maç</span>
+      <div class="stepper"><button data-set="autoMaxN" data-d="-1">−</button><input value="${s.autoMaxN}" readonly aria-label="En çok maç"><button data-set="autoMaxN" data-d="1">+</button></div></div>
+  </div>` : `
   <div class="field">
     <span class="lbl">Maç sayısı</span>
     <div class="stepper"><button data-set="n" data-d="-1">−</button><input value="${s.n}" readonly aria-label="Maç sayısı"><button data-set="n" data-d="1">+</button></div>
@@ -692,7 +826,7 @@ function settingsHtml() {
     <div class="field"><span class="lbl">Misli</span>
       <div class="stepper"><button data-set="misli" data-d="-1">−</button><input value="${s.misli}" readonly aria-label="Misli"><button data-set="misli" data-d="1">+</button></div></div>
     <div class="field"><label for="f-unit">Misli bedeli (TL)</label><input id="f-unit" class="inp" type="number" inputmode="decimal" min="0.25" step="0.25" value="${s.unit}" data-setin="unit"></div>
-  </div>
+  </div>`}
   <div class="two">
     <div class="field"><label for="f-min">En düşük oran</label><input id="f-min" class="inp" type="number" inputmode="decimal" step="0.05" min="1.01" value="${s.minOdd}" data-setin="minOdd"></div>
     <div class="field"><label for="f-max">En yüksek oran</label><input id="f-max" class="inp" type="number" inputmode="decimal" step="0.05" min="1.05" value="${s.maxOdd}" data-setin="maxOdd"></div>
@@ -740,8 +874,17 @@ let settingsDirty = { reanalyze: false, regen: false };
 function onSettingsAction(t) {
   const s = state.settings;
   const k = t.dataset.set;
-  if (k === 'n') {
-    s.n = Math.max(3, Math.min(8, s.n + Number(t.dataset.d)));
+  if (k === 'sysMode') {
+    s.sysMode = t.dataset.v;
+    settingsDirty.regen = true;
+  } else if (k === 'autoMinN') {
+    s.autoMinN = Math.max(2, Math.min(s.autoMaxN, s.autoMinN + Number(t.dataset.d)));
+    settingsDirty.regen = true;
+  } else if (k === 'autoMaxN') {
+    s.autoMaxN = Math.max(s.autoMinN, Math.min(10, s.autoMaxN + Number(t.dataset.d)));
+    settingsDirty.regen = true;
+  } else if (k === 'n') {
+    s.n = Math.max(3, Math.min(10, s.n + Number(t.dataset.d)));
     s.sizes = s.sizes.filter((x) => x <= s.n);
     if (!s.sizes.length) s.sizes = [s.n];
     settingsDirty.regen = true;
@@ -778,6 +921,8 @@ function onSettingsInput(t) {
     if (!Number.isFinite(v)) return;
     const k = t.dataset.setin;
     if (k === 'unit') s.unit = Math.max(0.25, v);
+    if (k === 'budget') s.budget = Math.max(1, v);
+    if (k === 'minStake') s.minStake = Math.max(0, v);
     if (k === 'minOdd') s.minOdd = Math.max(1.01, v);
     if (k === 'maxOdd') s.maxOdd = Math.max(s.minOdd + 0.05, v);
     settingsDirty.regen = true;
@@ -796,7 +941,7 @@ async function applySettings() {
     await loadStatsForTop();
     setProgress(null);
   }
-  if (d.reanalyze || d.regen) { state.tempExcluded.clear(); generateCoupon(); }
+  if (d.reanalyze || d.regen) { state.tempExcluded.clear(); await buildCoupon(); }
   setStatus(statusLine());
   render();
 }
@@ -807,8 +952,9 @@ function infoHtml() {
   <p class="note">1. <b>Veri:</b> Bülten ve oranlar iddaa.com'dan canlı çekilir. İstatistikler (puan durumu, son 10 maç, aralarındaki maçlar, iddaa istatistik notları) iddaa istatistik servisinden gelir.</p>
   <p class="note">2. <b>Olasılık:</b> Her pazarın oranından iddaa'nın kâr payı çıkarılır. Sonra tüm pazarlara (MS, Alt/Üst, KG, handikap, takım golleri, ilk yarı…) aynı anda uyan bir gol modeli (Dixon-Coles düzeltmeli Poisson) kurulur. Böylece her seçenek için tutarlı bir olasılık elde edilir; açık olan istatistik ağırlığı kadar da takım istatistiklerinden kurulan model karıştırılır.</p>
   <p class="note">3. <b>Değer:</b> oran × olasılık. 1.00 adil oran demektir. iddaa'nın kâr payı %15-25 olduğundan çoğu seçenek 0.80-0.92 arasındadır; uygulama en yüksek değerlileri öne alır.</p>
-  <p class="note">4. <b>Sistem:</b> Seçtiğin sistemdeki her kolon (örn. 6 maçta 3-4-5-6 = 20+15+6+1 = 42 kolon) ayrı hesaplanır. 2⁶ = 64 olası sonuç tek tek değerlendirilip kazanç, kâra geçme olasılığı ve beklenen dönüş bulunur.</p>
-  <p class="note">5. <b>Optimizasyon:</b> Her maçtan tek seçim olacak, MBS kuralına uyacak ve aynı ligden fazla maç olmayacak şekilde, seçtiğin hedefe (kâr şansı / beklenen getiri / büyük vurgun) göre en iyi kombinasyon aranır.</p>
+  <p class="note">4. <b>Sistem hesabı:</b> Her kolon ayrı hesaplanır (örn. 6 maçta 3-4-5-6 = 20+15+6+1 = 42 kolon). Tüm olası sonuçlar (6 maçta 2⁶ = 64) tek tek değerlendirilip kazanç, kâra geçme olasılığı ve beklenen dönüş bulunur.</p>
+  <p class="note">5. <b>En iyi sistem (Otomatik):</b> Bütçene sığan bütün sistemler (ör. 5 maç 2'li, 6 maç 3'lü, 7 maç 3-4, 6 maç 3-4-5-6…) denenir; her biri için maçlar ayrı ayrı optimize edilir ve seçtiğin hedefe göre en iyisi seçilir. Karşılaştırma tablosundan diğerlerine geçebilirsin.</p>
+  <p class="note">6. <b>Neden küçük kolonlar?</b> Bir kolondaki her maç iddaa'nın kâr payını bir kez daha çarpar: 2'li kolon 1 TL'ye ~0.75 TL, 3'lü ~0.64, 4'lü ~0.55, 6'lı ~0.41 TL geri döndürür. Bu yüzden 5-6'lı kolonlar sadece büyük ikramiye şansı katar, kâr şansını ve getiriyi düşürür. 2'li kolon için kupondaki maçların MBS'si en fazla 2 olmalıdır; uygulama bunu otomatik kontrol eder.</p>
   <div class="warnbox mt12"><b>Önemli:</b> Hiçbir model kazanç garanti etmez. Kâr payı nedeniyle sistem kuponlarının uzun vadeli beklenen dönüşü yatırılanın altındadır; uygulama bu kaybı küçültmeye ve en olası kombinasyonları bulmaya çalışır. Kaybetmeyi göze alabileceğin tutarla oyna. 18 yaş altına yasaktır.</div>`;
 }
 
@@ -848,20 +994,29 @@ function replaceSlot(i, newPick) {
   saveCoupon();
 }
 
-function addPickToCoupon(pickId) {
+async function addPickToCoupon(pickId) {
   const p = state.pickById.get(pickId);
   if (!p) return;
   const s = state.settings;
-  const minSize = Math.min(...s.sizes);
-  if ((p.mbc ?? 1) > minSize) { toast(`Bu seçimin MBS'si ${p.mbc}; ${minSize}'li kolonlarda oynanamaz`); return; }
-  if (!state.coupon) state.coupon = { ids: [], locked: new Set(), excluded: new Set() };
+  if (!state.coupon) state.coupon = { ids: [], locked: new Set(), excluded: new Set(), sys: null, ranking: null };
   const c = state.coupon;
   c.excluded.delete(p.eventId);
-  const sameEvent = c.ids.findIndex((id) => Number(String(id).split(':')[0]) === p.eventId);
-  if (sameEvent >= 0) {
-    c.locked.delete(c.ids[sameEvent]);
-    c.ids[sameEvent] = p.id;
-  } else if (c.ids.length < s.n) {
+  state.tempExcluded.delete(p.eventId);
+  // drop any other pick from the same match
+  const sameEvent = c.ids.find((id) => Number(String(id).split(':')[0]) === p.eventId);
+  if (sameEvent) { c.ids = c.ids.filter((id) => id !== sameEvent); c.locked.delete(sameEvent); }
+  if (s.sysMode === 'auto') {
+    // lock it and search again: the best system may change to fit this pick's MBS
+    c.ids.push(p.id);
+    c.locked.add(p.id);
+    await buildCoupon();
+    toast(couponPicks().some((q) => q.id === p.id) ? 'Eklendi, sistem yeniden hesaplandı' : 'Bu seçim bütçeye uyan bir sisteme sığmadı');
+    return;
+  }
+  const sys = couponSys();
+  const minSize = minSizeOf(sys);
+  if ((p.mbc ?? 1) > minSize) { toast(`Bu seçimin MBS'si ${p.mbc}; ${li(minSize)} kolonlarda oynanamaz`); return; }
+  if (c.ids.length < sys.n) {
     c.ids.push(p.id);
   } else {
     // replace the weakest unlocked pick
@@ -877,13 +1032,13 @@ function addPickToCoupon(pickId) {
 }
 
 function saveToHistory() {
-  const s = state.settings;
+  const sys = couponSys();
   const picks = couponPicks();
-  if (picks.length < Math.min(...s.sizes)) { toast('Kupon eksik'); return; }
-  const r = evaluateSystem(picks, s.sizes, s.misli, s.unit);
+  if (picks.length < minSizeOf(sys)) { toast('Kupon eksik'); return; }
+  const r = evaluateSystem(picks, sys.sizes, sys.misli, sys.unit);
   const entry = {
     id: Date.now(), createdAt: Date.now(), day: gameDay(),
-    sizes: r.sizes, misli: s.misli, unit: s.unit, stake: r.stake,
+    sizes: r.sizes, misli: sys.misli, unit: sys.unit, stake: r.stake,
     pProfit: r.pProfit, evRatio: r.evRatio,
     picks: picks.map((p) => {
       const e = state.eventsById.get(p.eventId);
@@ -938,24 +1093,33 @@ function onAction(ev) {
     case 'reload': loadAll(true); break;
     case 'obj':
       s.objective = t.dataset.v; saveSettings();
-      if (state.phase === 'ready') { state.tempExcluded.clear(); generateCoupon(); }
+      if (state.phase === 'ready') { state.tempExcluded.clear(); buildCoupon().then(render); }
       render();
       break;
     case 'regen':
+      if (state.phase !== 'ready') break;
       state.tempExcluded.clear();
-      generateCoupon();
-      render();
-      toast('Kupon yeniden hesaplandı');
+      buildCoupon().then(() => { render(); toast('Kupon yeniden hesaplandı'); });
       break;
     case 'another': {
+      if (state.phase !== 'ready' || !state.coupon) break;
       const c = state.coupon;
       for (const p of couponPicks()) if (!c.locked.has(p.id)) state.tempExcluded.add(p.eventId);
-      let ok = generateCoupon();
-      if (!ok || couponPicks().length < s.n) { state.tempExcluded.clear(); ok = generateCoupon(); toast('Başka uygun kombinasyon kalmadı, en iyiye dönüldü'); }
-      else toast('Farklı maçlarla yeni öneri');
-      render();
+      buildCoupon().then(async (ok) => {
+        if (!ok || couponPicks().length < couponSys().n) {
+          state.tempExcluded.clear();
+          await buildCoupon();
+          toast('Başka uygun kombinasyon kalmadı, en iyiye dönüldü');
+        } else toast('Farklı maçlarla yeni öneri');
+        render();
+      });
       break;
     }
+    case 'use-sys':
+      useRanking(Number(t.dataset.i));
+      render();
+      toast('Sistem değiştirildi');
+      break;
     case 'lock': {
       const p = slotPick(t.dataset.i);
       if (!p) break;
@@ -986,7 +1150,7 @@ function onAction(ev) {
       openSheet(`<h3>Yerine ne koyalım?</h3>
         <p class="note">Şu an: ${esc(curE?.hn)} – ${esc(curE?.an)} · <b>${esc(cur.label)}</b> (${fmtOdd(cur.odd)})</p>
         <h4>Aynı maçta diğer seçenekler</h4>
-        ${(state.analyses.get(cur.eventId)?.picks || []).filter((p) => p.id !== cur.id && p.odd >= s.minOdd && p.odd <= s.maxOdd && (p.mbc ?? 1) <= Math.min(...s.sizes) && s.groups.includes(p.group)).sort((a, b) => b.v - a.v).slice(0, 5).map((p) => altRow(p, i)).join('') || '<p class="note">Yok</p>'}
+        ${(state.analyses.get(cur.eventId)?.picks || []).filter((p) => p.id !== cur.id && p.odd >= s.minOdd && p.odd <= s.maxOdd && (p.mbc ?? 1) <= minSizeOf(couponSys()) && s.groups.includes(p.group)).sort((a, b) => b.v - a.v).slice(0, 5).map((p) => altRow(p, i)).join('') || '<p class="note">Yok</p>'}
         <h4>Başka maçlar (kupona en iyi uyanlar)</h4>
         ${alts.map((a) => altRow(a.pick, i)).join('') || '<p class="note">Uygun alternatif yok</p>'}`);
       break;
@@ -998,9 +1162,10 @@ function onAction(ev) {
     }
     case 'match': openMatch(Number(t.dataset.id)); break;
     case 'add':
-      addPickToCoupon(t.dataset.pick);
-      if (sheetOpen) { const id = state.pickById.get(t.dataset.pick)?.eventId; if (id) { const top = $('#sheet-body').scrollTop; $('#sheet-body').innerHTML = matchSheetHtml(id); $('#sheet-body').scrollTop = top; } }
-      render();
+      addPickToCoupon(t.dataset.pick).then(() => {
+        if (sheetOpen) { const id = state.pickById.get(t.dataset.pick)?.eventId; if (id) { const top = $('#sheet-body').scrollTop; $('#sheet-body').innerHTML = matchSheetHtml(id); $('#sheet-body').scrollTop = top; } }
+        render();
+      });
       break;
     case 'copy': copyText(couponText()); break;
     case 'save': saveToHistory(); break;
@@ -1021,17 +1186,20 @@ function onAction(ev) {
     case 'combo-use': {
       const c = state.combos?.[Number(t.dataset.i)];
       if (!c) break;
-      const minSize = Math.min(...s.sizes);
+      // in auto mode the search adapts the system to the picks' MBS; in manual mode MBS must fit
+      const minSize = s.sysMode === 'auto' ? 99 : minSizeOf(manualSys());
       const ok = c.picks.filter((p) => (p.mbc ?? 1) <= minSize);
-      if (!state.coupon) state.coupon = { ids: [], locked: new Set(), excluded: new Set() };
+      if (!state.coupon) state.coupon = { ids: [], locked: new Set(), excluded: new Set(), sys: null, ranking: null };
       state.coupon.locked = new Set(ok.map((p) => p.id));
       state.coupon.ids = ok.map((p) => p.id);
       ok.forEach((p) => state.coupon.excluded.delete(p.eventId));
       state.tempExcluded.clear();
-      generateCoupon();
       state.tab = 'kupon'; store.set('tab', 'kupon');
-      render();
-      toast(ok.length < c.picks.length ? 'MBS nedeniyle bazı maçlar eklenemedi' : 'Kombinasyon sisteme sabitlendi');
+      buildCoupon().then(() => {
+        render();
+        const inCoupon = ok.filter((p) => state.coupon.ids.includes(p.id)).length;
+        toast(inCoupon < c.picks.length ? 'Bazı maçlar MBS/bütçe nedeniyle eklenemedi' : 'Kombinasyon sisteme sabitlendi');
+      });
       break;
     }
     case 'hist-check': checkResults(); break;
@@ -1091,11 +1259,11 @@ async function loadAll(force = false) {
     await loadStatsForTop();
     state.combos = null;
     if (!state.coupon) {
-      if (!restoreCoupon()) generateCoupon();
+      if (!restoreCoupon()) await buildCoupon();
     } else {
       // refresh: keep the user's coupon, refill slots whose markets closed
       const valid = couponPicks();
-      if (valid.length < state.coupon.ids.length || valid.length < state.settings.n) generateCoupon({ keepIds: true });
+      if (valid.length < state.coupon.ids.length || valid.length < couponSys().n) await buildCoupon({ keepIds: true });
     }
     state.phase = 'ready';
     state.error = null;

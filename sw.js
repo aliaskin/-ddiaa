@@ -1,8 +1,8 @@
 // App shell cache. API calls to iddaa are never cached here.
-const CACHE = 'sistem-kupon-v1';
+const CACHE = 'sistem-kupon-v2';
 const SHELL = [
   './', 'index.html', 'css/app.css', 'manifest.webmanifest',
-  'js/app.js', 'js/api.js', 'js/model.js', 'js/markets.js', 'js/system.js', 'js/optimizer.js',
+  'js/app.js', 'js/api.js', 'js/model.js', 'js/markets.js', 'js/system.js', 'js/optimizer.js', 'js/autosystem.js',
   'icons/icon.svg', 'icons/icon-192.png', 'icons/apple-touch-icon.png',
 ];
 
