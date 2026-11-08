@@ -34,13 +34,13 @@ export function payoutFor(hitOdds, sizes, misli = 1, unit = 1) {
 }
 
 // picks: [{p, odd}] ; returns full outcome distribution summary.
-export function evaluateSystem(picks, sizes, misli = 1, unit = 1) {
+export function evaluateSystem(picks, sizes, misli = 1, unit = 1, target = Infinity) {
   const n = picks.length;
   const valid = sizes.filter((k) => k >= 1 && k <= n);
   const columns = columnCount(n, valid);
   const stake = columns * misli * unit;
   const byHits = Array.from({ length: n + 1 }, (_, k) => ({ k, prob: 0, minPay: Infinity, maxPay: 0, wsum: 0 }));
-  let ev = 0, pProfit = 0, pReturn = 0, pBig = 0, pGood = 0;
+  let ev = 0, pProfit = 0, pReturn = 0, pBig = 0, pGood = 0, pTarget = 0;
   const total = 1 << n;
   const odds = new Array(n);
   for (let mask = 0; mask < total; mask++) {
@@ -55,6 +55,7 @@ export function evaluateSystem(picks, sizes, misli = 1, unit = 1) {
     if (pay >= stake * GOOD) pGood += prob;
     if (pay > 0) pReturn += prob;
     if (pay >= stake * 10) pBig += prob;
+    if (pay >= target) pTarget += prob;
     const b = byHits[c];
     b.prob += prob;
     b.wsum += prob * pay;
@@ -70,7 +71,7 @@ export function evaluateSystem(picks, sizes, misli = 1, unit = 1) {
   return {
     n, sizes: valid, columns, stake, misli, unit,
     ev, evRatio: stake > 0 ? ev / stake : 0,
-    pProfit, pGood, pReturn, pBig,
+    pProfit, pGood, pReturn, pBig, pTarget, target,
     maxPay: payoutFor(allOdds, valid, misli, unit),
     byHits,
   };
@@ -80,14 +81,14 @@ export function evaluateSystem(picks, sizes, misli = 1, unit = 1) {
 // Depth-first over hit/miss of each pick, updating the symmetric polynomials incrementally,
 // and skipping branches that can no longer reach the smallest column size (they pay 0).
 const stackCache = new Map();
-export function quickEval(ps, os, sizes, stake, misliUnit) {
+export function quickEval(ps, os, sizes, stake, misliUnit, target = Infinity) {
   const n = ps.length;
   const minK = Math.min(...sizes);
   let st = stackCache.get(n);
   if (!st) { st = Array.from({ length: n + 1 }, () => new Float64Array(n + 1)); stackCache.set(n, st); }
   st[0].fill(0); st[0][0] = 1;
   const nS = sizes.length;
-  let ev = 0, pProfit = 0, pBig = 0, pGood = 0;
+  let ev = 0, pProfit = 0, pBig = 0, pGood = 0, pTarget = 0;
   const good = stake * GOOD, big = stake * 10;
   const rec = (i, c, prob) => {
     if (c + (n - i) < minK) return;
@@ -100,6 +101,7 @@ export function quickEval(ps, os, sizes, stake, misliUnit) {
       if (pay > stake) pProfit += prob;
       if (pay >= good) pGood += prob;
       if (pay >= big) pBig += prob;
+      if (pay >= target) pTarget += prob;
       return;
     }
     const cur = st[i], nxt = st[i + 1];
@@ -115,5 +117,36 @@ export function quickEval(ps, os, sizes, stake, misliUnit) {
     rec(i + 1, c, prob * (1 - ps[i]));
   };
   rec(0, 0, 1);
-  return { ev, evRatio: ev / stake, pProfit, pGood, pBig };
+  return { ev, evRatio: ev / stake, pProfit, pGood, pBig, pTarget };
+}
+
+// Monte Carlo: play the coupon N times with each pick winning with its probability.
+// (Exact numbers come from evaluateSystem; this is the "10.000 kez oynasaydın" view.)
+export function simulateCoupon(picks, sizes, misli = 1, unit = 1, { runs = 10000, seed = 1, target = Infinity } = {}) {
+  const n = picks.length;
+  const valid = sizes.filter((k) => k >= 1 && k <= n);
+  const stake = columnCount(n, valid) * misli * unit;
+  let a = seed >>> 0;
+  const rnd = () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+  const hits = new Array(n + 1).fill(0);
+  let profit = 0, reached = 0, sum = 0, best = 0, anyPay = 0;
+  const odds = [];
+  for (let r = 0; r < runs; r++) {
+    odds.length = 0;
+    for (const p of picks) if (rnd() < p.p) odds.push(p.odd);
+    hits[odds.length]++;
+    const pay = payoutFor(odds, valid, misli, unit);
+    sum += pay;
+    if (pay > 0) anyPay++;
+    if (pay > stake) profit++;
+    if (pay >= target) reached++;
+    if (pay > best) best = pay;
+  }
+  return { runs, stake, hits, anyPay, profit, reached, avgPay: sum / runs, best, target };
 }

@@ -329,7 +329,8 @@ function clampL(x) { return Math.max(0.15, Math.min(4.5, x)); }
 // Analyse one event. opts: { oddField, statsWeight, stats }
 export function analyzeEvent(event, opts = {}) {
   const oddField = opts.oddField || 'odd';
-  const markets = normalizeMarkets(event, oddField);
+  const markets = normalizeMarkets(event, oddField, opts.marketNames);
+  const [loOdd, hiOdd] = opts.oddRange || [1.0, Infinity];
   if (!markets.find((m) => m.key === '1_1')) return null;
   const targets = buildTargets(markets);
   if (targets.ft.length < 1) return null;
@@ -341,30 +342,49 @@ export function analyzeEvent(event, opts = {}) {
   const w = opts.stats ? (opts.statsWeight ?? 0.2) : 0;
   if (w > 0) {
     sl = statsLambdas(opts.stats);
-    if (sl) cellsStats = jointCells(sl.lh, sl.la, fit.rho, f);
+    // Statistics nudge the expected goals (geometric blend); they do not override the market.
+    // Mixing raw stats probabilities in directly would hugely inflate long shots.
+    if (sl) {
+      const lhB = Math.exp((1 - w) * Math.log(fit.lh) + w * Math.log(sl.lh));
+      const laB = Math.exp((1 - w) * Math.log(fit.la) + w * Math.log(sl.la));
+      sl.blend = { lh: lhB, la: laB };
+      cellsStats = jointCells(lhB, laB, fit.rho, f);
+    }
   }
 
   const picks = [];
   for (const mk of markets) {
+    if (mk.def.generic && !mk.fair) {
+      const { probs, margin } = devig(mk.outcomes.map((o) => o.odd));
+      mk.fair = probs; mk.margin = margin;
+    }
     mk.outcomes.forEach((o, i) => {
-      const pred = mk.def.pred(o.no, mk.line);
-      const pModel = probOf(cellsMkt, pred);
+      if (o.odd < loOdd || o.odd > hiOdd) return;
+      const ctx = { name: o.name, names: mk.names };
       const pFair = mk.fair ? mk.fair[i] : null;
-      // market consensus: model fitted on all markets, mixed with this market's own fair price
-      const pMarket = pFair === null ? pModel : 0.5 * pModel + 0.5 * pFair;
-      let p = pMarket;
-      let pStats = null;
-      if (cellsStats) {
-        pStats = probOf(cellsStats, pred);
-        p = (1 - w) * pMarket + w * pStats;
+      let pModel = null, pStats = null, p;
+      if (mk.def.generic) {
+        // corners, cards, ...: no goal model, use the market's own margin-free price
+        p = pFair;
+      } else {
+        const pred = mk.def.pred(o.no, mk.line, ctx);
+        pModel = probOf(cellsMkt, pred);
+        if (cellsStats) pStats = probOf(cellsStats, pred);
+        const pGoal = pStats ?? pModel;
+        // consensus: goal model fitted on all markets, mixed with this market's own fair price
+        p = pFair === null ? pGoal : 0.5 * pGoal + 0.5 * pFair;
       }
+      if (!(p > 0)) return;
+      const named = mk.def.named;
       picks.push({
         id: pickId(event.i, mk.key, mk.line, o.no),
         eventId: event.i,
         key: mk.key, line: mk.line, no: o.no,
+        name: o.name, names: named ? mk.names : undefined,
         group: mk.def.group,
         market: mk.def.name,
-        label: pickLabel(mk.key, mk.line, o.no),
+        generic: !!mk.def.generic,
+        label: pickLabel(mk.def, mk.line, o.no, ctx),
         odd: o.odd,
         p, pModel, pFair, pStats,
         v: p * o.odd,

@@ -4,9 +4,9 @@
 import { quickEval, evaluateSystem, columnCount } from './system.js';
 
 export const OBJECTIVES = {
-  kar: { name: 'Kâr şansı (önerilen)', desc: 'Kuponun en az %25 kârla bitme olasılığını en yükseğe çıkarır.', f: (r) => r.pGood + 1.0 * (r.evRatio - 1) },
+  hedef: { name: 'Hedef kazanç', desc: 'Belirlediğin hedef kazanca (ör. 10.000 TL) ulaşma olasılığını en yükseğe çıkarır.', f: (r) => r.pTarget + 0.01 * (r.evRatio - 1) },
+  kar: { name: 'Kâr şansı', desc: 'Kuponun en az %25 kârla bitme olasılığını en yükseğe çıkarır.', f: (r) => r.pGood + 1.0 * (r.evRatio - 1) },
   deger: { name: 'Beklenen getiri', desc: 'Uzun vadede TL başına beklenen dönüşü en yükseğe çıkarır.', f: (r) => r.evRatio + 0.1 * r.pProfit },
-  buyuk: { name: 'Büyük vurgun', desc: 'Yatırılanın en az 10 katı kazanma olasılığını en yükseğe çıkarır.', f: (r) => r.pBig + 0.1 * (r.evRatio - 1) },
 };
 
 export function mulberry32(seed) {
@@ -34,7 +34,7 @@ export function filterPicks(allPicks, opts) {
     (!opts.groups || opts.groups.has(p.group)) &&
     (p.mbc ?? 1) <= opts.maxMbc &&
     !(opts.excluded && opts.excluded.has(p.eventId)) &&
-    p.p >= (opts.minProb ?? 0.12));
+    p.p >= (opts.minProb ?? 0.03));
 }
 
 // Keep a manageable pool: best few picks per match, ranked by value.
@@ -53,14 +53,14 @@ export function buildPool(picks, perEvent = 4, size = 160) {
   return pool.slice(0, size);
 }
 
-function makeScorer(sizes, misli, unit, n, objective) {
+function makeScorer(sizes, misli, unit, n, objective, target = Infinity) {
   const columns = columnCount(n, sizes);
   const stake = columns * misli * unit;
   const fn = (OBJECTIVES[objective] || OBJECTIVES.kar).f;
   const ps = new Float64Array(n), os = new Float64Array(n);
   return (set) => {
     for (let i = 0; i < n; i++) { ps[i] = set[i].p; os[i] = set[i].odd; }
-    return fn(quickEval(ps, os, sizes, stake, misli * unit));
+    return fn(quickEval(ps, os, sizes, stake, misli * unit, target));
   };
 }
 
@@ -84,7 +84,7 @@ export function optimizeSystem(pool, opts) {
   const sizes = opts.sizes.filter((k) => k <= n);
   const locked = (opts.locked || []).slice(0, n);
   const maxPerLeague = opts.maxPerLeague ?? 2;
-  const score = makeScorer(sizes, opts.misli, opts.unit ?? 1, n, opts.objective);
+  const score = makeScorer(sizes, opts.misli, opts.unit ?? 1, n, opts.objective, opts.target);
   const rnd = mulberry32(opts.seed ?? 1);
   const free = n - locked.length;
   const cand = pool.filter((c) => !locked.some((l) => l.eventId === c.eventId));
@@ -152,14 +152,14 @@ export function optimizeSystem(pool, opts) {
     if (r.s > best.s) best = { set: r.set.slice(), s: r.s };
   }
   const picks = best.set;
-  return { picks, score: best.s, result: evaluateSystem(picks, sizes, opts.misli, opts.unit ?? 1) };
+  return { picks, score: best.s, result: evaluateSystem(picks, sizes, opts.misli, opts.unit ?? 1, opts.target) };
 }
 
 // Alternatives for one slot of an existing coupon, best first.
 export function alternativesFor(pool, picks, slot, opts, limit = 8) {
   const n = picks.length;
   const sizes = opts.sizes.filter((k) => k <= n);
-  const score = makeScorer(sizes, opts.misli, opts.unit ?? 1, n, opts.objective);
+  const score = makeScorer(sizes, opts.misli, opts.unit ?? 1, n, opts.objective, opts.target);
   const set = picks.slice();
   const out = [];
   for (const c of pool) {

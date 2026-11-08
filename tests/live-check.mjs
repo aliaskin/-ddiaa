@@ -43,9 +43,9 @@ const allowed = filterPicks(all, { minOdd: 1.4, maxOdd: 3.2, groups: new Set(['M
 const pool = buildPool(allowed);
 console.log('allowed', allowed.length, 'pool', pool.length, 'top v', pool.slice(0, 5).map((p) => p.label + '@' + p.odd + ' v' + p.v.toFixed(3)));
 
-for (const objective of ['kar', 'deger', 'buyuk']) {
+for (const objective of ['hedef', 'kar', 'deger']) {
   const t2 = performance.now();
-  const r = optimizeSystem(pool, { n: 6, sizes: [3, 4, 5, 6], misli: 2, unit: 1, objective, seed: 42 });
+  const r = optimizeSystem(pool, { n: 6, sizes: [3, 4, 5, 6], misli: 2, unit: 1, objective, target: 10000, seed: 42 });
   const t3 = performance.now();
   console.log(`\n== ${objective} (${(t3 - t2).toFixed(0)} ms) stake ${r.result.stake} EV ${r.result.evRatio.toFixed(3)} P(kar) ${(r.result.pProfit * 100).toFixed(1)}% P(25%+) ${(r.result.pGood * 100).toFixed(1)}% P(10x) ${(r.result.pBig * 100).toFixed(1)}% max ${r.result.maxPay.toFixed(0)}`);
   for (const p of r.picks) console.log('  ', `${p.ev.hn} - ${p.ev.an}`.padEnd(45), p.label.padEnd(18), p.odd.toFixed(2), (p.p * 100).toFixed(1) + '%', 'v', p.v.toFixed(3), 'mbc', p.mbc);

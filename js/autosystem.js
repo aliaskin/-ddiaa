@@ -46,7 +46,7 @@ export function searchSystems(picks, cfg, opts, onProgress) {
     const pool = poolFor(L.sizes[0], poolSize);
     if (pool.length + locked.length < L.n) return null;
     const r = optimizeSystem(pool, {
-      n: L.n, sizes: L.sizes, misli: L.misli, unit: L.unit, objective: opts.objective,
+      n: L.n, sizes: L.sizes, misli: L.misli, unit: L.unit, objective: opts.objective, target: opts.target,
       locked, maxPerLeague: opts.maxPerLeague, effort,
       seed: hashString(`${opts.seedBase}|${L.n}|${L.sizes.join(',')}`),
     });
@@ -80,5 +80,5 @@ export function searchSystems(picks, cfg, opts, onProgress) {
 function key(s) { return `${s.n}|${s.sizes.join(',')}`; }
 
 function pickMetrics(r) {
-  return { ev: r.ev, evRatio: r.evRatio, pProfit: r.pProfit, pGood: r.pGood, pBig: r.pBig, pReturn: r.pReturn, maxPay: r.maxPay };
+  return { ev: r.ev, evRatio: r.evRatio, pProfit: r.pProfit, pGood: r.pGood, pBig: r.pBig, pTarget: r.pTarget, pReturn: r.pReturn, maxPay: r.maxPay };
 }

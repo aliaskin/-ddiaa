@@ -64,6 +64,22 @@ export async function fetchCompetitions() {
   return out;
 }
 
+// Full market list of one event (the bulletin only carries the main markets).
+export async function fetchEventDetail(eventId) {
+  return getJson(`${SB}/event/${eventId}`, 15000);
+}
+
+// Market names ("t_st" -> name) for markets we price from their own odds (corners, cards, ...).
+export async function fetchMarketNames() {
+  const cached = cacheGet('mnames', 7 * 864e5);
+  if (cached) return cached;
+  const data = await getJson(`${SB}/get_market_config`);
+  const out = {};
+  for (const [k, v] of Object.entries(data?.m || {})) if (v?.n) out[k] = v.n;
+  cacheSet('mnames', out);
+  return out;
+}
+
 // ---------- statistics ----------
 function summarizeRecent(d, side) {
   if (!d || !Array.isArray(d.m)) return null;
