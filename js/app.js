@@ -1,13 +1,14 @@
-import { analyzeEvent, cellMask } from './model.js?v=7';
-import { filterPicks, buildPool, optimizeSystem, alternativesFor, findTargetCombos, OBJECTIVES, hashString, mulberry32 } from './optimizer.js?v=7';
-import { evaluateSystem, columnCount, payoutFor } from './system.js?v=7';
-import { GROUPS, MARKETS, settlePick } from './markets.js?v=7';
-import { searchSystems } from './autosystem.js?v=7';
-import * as api from './api.js?v=7';
-import { loadDay, saveDay } from './daystore.js?v=7';
+import { analyzeEvent, cellMask } from './model.js?v=8';
+import { filterPicks, buildPool, optimizeSystem, alternativesFor, findTargetCombos, OBJECTIVES, hashString, mulberry32 } from './optimizer.js?v=8';
+import { evaluateSystem, columnCount, payoutFor } from './system.js?v=8';
+import { GROUPS, MARKETS, settlePick } from './markets.js?v=8';
+import { searchSystems } from './autosystem.js?v=8';
+import * as api from './api.js?v=8';
+import { loadDay, saveDay } from './daystore.js?v=8';
+import { fetchOlbg, matchOlbg, marketTr, agreement } from './olbg.js?v=8';
 
 // Bump together with version.json on every release: an older copy on the phone reloads itself.
-const APP_VERSION = 7;
+const APP_VERSION = 8;
 
 // ---------- settings & storage ----------
 const SETTINGS_VERSION = 5;
@@ -85,6 +86,8 @@ const state = {
   pickById: new Map(),
   stats: new Map(),
   statsExtra: new Map(),
+  olbgData: null,
+  olbg: new Map(), // eventId -> OLBG tipster tips
   updatedAt: null,
   coupon: null, // { ids: [], locked: Set, excluded: Set, sys: {n,sizes,misli,unit,cols,stake}, ranking: [] }
   tempExcluded: new Set(),
@@ -479,6 +482,7 @@ function renderPick(p, i, locked) {
       ${p.simHits !== null && p.simHits !== undefined ? `<span>10.000 simülasyonda <b>${p.simHits.toLocaleString('tr-TR')}</b> kez</span>` : ''}
       <span class="badge ${valueClass(p.v)}" title="Değer = oran × olasılık">değer ${p.v.toFixed(2)}</span>
     </div>
+    ${olbgLine(p)}
   </article>`;
 }
 
@@ -514,6 +518,36 @@ function simulateDay(picks, sys, target) {
     if (pay > best) best = pay;
   }
   return { runs, stake, hits, anyPay, profit, reached, avgPay: sum / runs, best, target };
+}
+
+// One line of OLBG tipster consensus under a pick (information only).
+function olbgLine(p) {
+  const tips = state.olbg.get(p.eventId);
+  if (!tips?.length) return '';
+  const t = tips[0];
+  const ag = agreement(p, tips);
+  const mark = ag === true ? '<span class="badge good">bizimle uyumlu</span>' : ag === false ? '<span class="badge warn">bizden farklı</span>' : '';
+  return `<div class="olbg-line">OLBG: <b>${esc(t.sel)}</b> (${esc(marketTr(t.market))}) · ${t.win}/${t.total} tipster ${mark}</div>`;
+}
+
+function olbgBlock(eventId) {
+  const tips = state.olbg.get(eventId);
+  if (!tips?.length) return '';
+  return `<h4>OLBG tipsterları</h4>${tips.map((t) => `
+    <div class="mk-row"><div>${esc(marketTr(t.market))}: <b>${esc(t.sel)}</b><div class="small muted">${t.win}/${t.total} tipster${t.conf ? ` · güven %${t.conf}` : ''}${t.stars ? ` · ${'★'.repeat(Math.min(5, t.stars))}` : ''}</div></div>
+    <div class="p"></div><div class="o">${t.odds ? fmtOdd(t.odds) : ''}</div><div></div></div>`).join('')}
+    <p class="note mt8">OLBG topluluğunun tahminleri, bilgi amaçlıdır; olasılık hesabına katılmaz.${state.olbgData?.updatedAt ? ` Güncelleme: ${new Date(state.olbgData.updatedAt * 1000).toLocaleString('tr-TR', { hour: '2-digit', minute: '2-digit', day: 'numeric', month: 'short' })}` : ''}</p>`;
+}
+
+// Tipster data is refreshed a few times a day by a GitHub workflow; read it on every open.
+async function loadOlbg() {
+  try {
+    const data = await fetchOlbg();
+    if (!data) return;
+    state.olbgData = data;
+    state.olbg = matchOlbg(data, state.events);
+    render();
+  } catch { /* optional information */ }
 }
 
 function renderSummary(picks) {
@@ -731,7 +765,7 @@ function renderMaclar() {
     <button class="match" data-act="match" data-id="${e.i}">
       <div class="time">${fmtTime(e.d)}<small>MBS ${e.mbc}</small></div>
       <div class="grow">
-        <div class="lg">${flagImg(e.ci)}<span class="ellipsis">${esc(compOf(e.ci).n)}</span>${youth ? '<span class="badge">K/Genç</span>' : ''}</div>
+        <div class="lg">${flagImg(e.ci)}<span class="ellipsis">${esc(compOf(e.ci).n)}</span>${youth ? '<span class="badge">K/Genç</span>' : ''}${state.olbg.has(e.i) ? '<span class="badge info">OLBG</span>' : ''}</div>
         <div class="t">${esc(e.hn)} – ${esc(e.an)}</div>
         ${ms.length ? `<div class="odds3">${[1, 2, 3].map((no) => `<span><i>${['1', 'X', '2'][no - 1]}</i>${fmtOdd(o(no)?.odd)}</span>`).join('')}</div>` : ''}
       </div>
@@ -839,6 +873,7 @@ function matchSheetHtml(eventId) {
     <p class="note mt8">Oranlardan hesaplandı (ort. kâr payı ${fmtPct(a.margin, 0)}).${a.stats?.blend ? ` İstatistikle düzeltilmiş beklenti ${a.stats.blend.lh.toFixed(2)} – ${a.stats.blend.la.toFixed(2)} gol, gollerin %${Math.round(a.stats.blend.half * 100)}'i ilk yarıda.` : ''}</p>
     ${simSection(a)}`;
   }
+  html += olbgBlock(eventId);
   html += `<h4>İstatistikler</h4><div id="stats-slot">${statsBlock(e, state.stats.get(eventId))}</div>`;
   if (a) {
     const byMarket = new Map();
@@ -1176,6 +1211,7 @@ async function applySettings() {
 function infoHtml() {
   return `
   <h3>Nasıl çalışır?</h3>
+  <p class="note"><b>OLBG tipsterları:</b> OLBG topluluğunun maç tahminleri günde 3 kez otomatik alınır. Eşleşen maçlarda seçimin altında ve maç ekranında gösterilir ("bizimle uyumlu / bizden farklı"); olasılık hesabını değiştirmez.</p>
   <p class="note"><b>Günlük kupon:</b> Kupon Türkiye saatiyle günlüktür. Gece 00:00'dan sonra oynanan maçlardan en fazla 3 tanesi kupona girer, diğerleri ertesi günün kuponuna kalır. Bütün maçların indirilmesi ve analizi günde bir kez yapılır (00:00'da ya da günün ilk açılışında) ve telefonda saklanır; gün içinde açınca hazır gelir. Üstteki yenile düğmesi analizi elle yeniden yapar.</p>
   <p class="note"><b>Gol bekle + sürpriz yok (varsayılan):</b> Alt, KG Yok, 0-0, "0-1 gol" gibi ya da ancak az gollü maçta tutan seçimler alınmaz. Kazanma ihtimali %22'nin altındaki takıma "kazanır" oynanmaz; favori maçı kazanıyorsa İY/MS 1/2 veya 2/1 serbesttir.</p>
   <p class="note"><b>Simülasyon:</b> Günün her maçı, oranlardan ve takım istatistiklerinden (puan durumu, son 10 maç, attığı/yediği goller, ilk yarı golleri) kurulan gol modeliyle 10.000 kez oynatılır. Her seçimin kaç kez tuttuğu ve kuponun bu 10.000 günde ne kazandırdığı gösterilir.</p>
@@ -1582,6 +1618,7 @@ async function loadAll(force = false) {
       });
     }
     loadedDay = today;
+    loadOlbg();
     scheduleMidnight();
     state.combos = null;
     if (!state.coupon) {

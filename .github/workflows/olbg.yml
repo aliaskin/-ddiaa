@@ -1,0 +1,38 @@
+# Refreshes data/olbg.json (OLBG football tipster consensus) three times a day.
+# The app reads it as extra information next to its own analysis.
+name: OLBG tipster verisi
+
+on:
+  schedule:
+    - cron: '7 21 * * *' # 00:07 Türkiye
+    - cron: '7 6 * * *'  # 09:07 Türkiye
+    - cron: '7 13 * * *' # 16:07 Türkiye
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: olbg
+  cancel-in-progress: false
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Fetch OLBG tips
+        run: node scripts/fetch-olbg.mjs data/olbg.json
+      - name: Commit when changed
+        run: |
+          if git diff --quiet -- data/olbg.json; then echo "no change"; exit 0; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/olbg.json
+          git commit -m "OLBG tipster verisi (otomatik)"
+          git pull --rebase origin "${GITHUB_REF_NAME}"
+          git push origin "HEAD:${GITHUB_REF_NAME}"

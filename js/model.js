@@ -6,7 +6,7 @@
 //    and blend it in.
 // Every pick then gets one consistent probability from the same score distribution.
 
-import { MARKETS, normalizeMarkets, pickId, pickLabel } from './markets.js?v=7';
+import { MARKETS, normalizeMarkets, pickId, pickLabel } from './markets.js?v=8';
 
 const G = 10; // full-time goals grid 0..G per team
 const GH = 6; // per-half goals grid 0..GH per team
@@ -428,7 +428,7 @@ export function analyzeEvent(event, opts = {}) {
       const ctx = { name: o.name, names: mk.names };
       const pFair = mk.fair ? mk.fair[i] : null;
       const label = pickLabel(mk.def, mk.line, o.no, ctx);
-      let pModel = null, pStats = null, p, simHits = null, upset = false, goalsIfWin = null;
+      let pModel = null, pStats = null, p, simHits = null, upset = false, goalsIfWin = null, winH = null, winA = null;
       // generic labels contain the market name (e.g. "Alt/Üst"), so only look at the outcome there
       let lowGoal = mk.def.generic ? /^(Alt|Yok|Hayır)$/i.test(String(o.name).trim()) : LOW_GOAL_LABEL.test(label);
       if (mk.def.generic) {
@@ -443,6 +443,7 @@ export function analyzeEvent(event, opts = {}) {
         // consensus: goal model fitted on all markets, mixed with this market's own fair price
         p = pFair === null ? pGoal : 0.5 * pGoal + 0.5 * pFair;
         goalsIfWin = d.goals;
+        winH = d.home; winA = d.away;
         // a pick that only wins in low-scoring games counts as "az gollü"
         if (d.goals < meanGoals - 0.9) lowGoal = true;
         // a pick that needs a clear underdog to win the match
@@ -466,7 +467,7 @@ export function analyzeEvent(event, opts = {}) {
         generic: !!mk.def.generic,
         label,
         odd: o.odd,
-        p, pModel, pFair, pStats, simHits, goalsIfWin, lowGoal, upset,
+        p, pModel, pFair, pStats, simHits, goalsIfWin, winH, winA, lowGoal, upset,
         v: p * o.odd,
         mbc: mk.mbc,
         margin: mk.margin ?? null,
