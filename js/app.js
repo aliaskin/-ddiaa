@@ -1,14 +1,14 @@
-import { analyzeEvent, cellMask } from './model.js?v=8';
-import { filterPicks, buildPool, optimizeSystem, alternativesFor, findTargetCombos, OBJECTIVES, hashString, mulberry32 } from './optimizer.js?v=8';
-import { evaluateSystem, columnCount, payoutFor } from './system.js?v=8';
-import { GROUPS, MARKETS, settlePick } from './markets.js?v=8';
-import { searchSystems } from './autosystem.js?v=8';
-import * as api from './api.js?v=8';
-import { loadDay, saveDay } from './daystore.js?v=8';
-import { fetchOlbg, matchOlbg, marketTr, agreement } from './olbg.js?v=8';
+import { analyzeEvent, cellMask } from './model.js?v=9';
+import { filterPicks, buildPool, optimizeSystem, alternativesFor, findTargetCombos, OBJECTIVES, hashString, mulberry32 } from './optimizer.js?v=9';
+import { evaluateSystem, columnCount, payoutFor } from './system.js?v=9';
+import { GROUPS, MARKETS, settlePick } from './markets.js?v=9';
+import { searchSystems } from './autosystem.js?v=9';
+import * as api from './api.js?v=9';
+import { loadDay, saveDay } from './daystore.js?v=9';
+import { fetchOlbg, matchOlbg, marketTr, agreement } from './olbg.js?v=9';
 
 // Bump together with version.json on every release: an older copy on the phone reloads itself.
-const APP_VERSION = 8;
+const APP_VERSION = 9;
 
 // ---------- settings & storage ----------
 const SETTINGS_VERSION = 5;
@@ -336,29 +336,34 @@ function lockedFrom(prev, keepIds) {
 // Fill the coupon for a fixed system layout (manual mode, or refilling an auto coupon).
 function fillCoupon(sys, { keepIds = false } = {}) {
   const prev = state.coupon || { ids: [], locked: new Set(), excluded: new Set() };
-  let lockedPicks = lockedFrom(prev, keepIds).filter((p) => (p.mbc ?? 1) <= minSizeOf(sys)).slice(0, sys.n);
-  let pool = buildPool(eligiblePicks({ maxMbc: minSizeOf(sys) }), 4, 160);
-  const lockedEvents = new Set(lockedPicks.map((p) => p.eventId));
-  const poolEvents = new Set(pool.map((p) => p.eventId).filter((id) => !lockedEvents.has(id)));
-  if (lockedPicks.length + poolEvents.size < sys.n && !sameSet(state.settings.groups, ALL_GOAL_GROUPS)) {
-    // Not enough matches offer the chosen bet type today: take the most likely one per match,
-    // then complete the coupon with the most suitable high-odds goal bets.
-    const bestPer = new Map();
-    for (const p of pool) {
-      if (lockedEvents.has(p.eventId)) continue;
-      const cur = bestPer.get(p.eventId);
-      if (!cur || p.p > cur.p) bestPer.set(p.eventId, p);
-    }
-    let late = lockedPicks.filter((p) => p.late).length;
-    for (const p of [...bestPer.values()].sort((a, b) => b.p - a.p)) {
-      if (lockedPicks.length >= sys.n) break;
-      if (p.late && late >= (state.settings.maxLate ?? 3)) continue;
+  const s = state.settings;
+  const lockedPicks = lockedFrom(prev, keepIds).filter((p) => (p.mbc ?? 1) <= minSizeOf(sys)).slice(0, sys.n);
+  const pool = buildPool(eligiblePicks({ maxMbc: minSizeOf(sys) }), 4, 160);
+  let r = optimizeSystem(pool, optOptions(lockedPicks, sys));
+  if ((!r || r.picks.length < sys.n) && !sameSet(s.groups, ALL_GOAL_GROUPS)) {
+    // The chosen bet type alone cannot make the coupon today (too few matches, or the rules —
+    // max per league, max after midnight — rule them out): keep the most likely picks of that type
+    // that fit the rules, then complete the coupon with the most suitable high-odds goal bets.
+    const keep = lockedPicks.slice();
+    const used = new Set(keep.map((p) => p.eventId));
+    const leagues = new Map();
+    let late = 0;
+    for (const p of keep) { leagues.set(p.league, (leagues.get(p.league) || 0) + 1); if (p.late) late++; }
+    for (const p of pool.slice().sort((a, b) => b.p - a.p)) {
+      if (keep.length >= sys.n - 1) break; // leave room so the rest can still be completed
+      if (used.has(p.eventId)) continue;
+      if (p.late && late >= (s.maxLate ?? 3)) continue;
+      if (s.maxPerLeague > 0 && (leagues.get(p.league) || 0) >= s.maxPerLeague) continue;
+      keep.push(p); used.add(p.eventId);
+      leagues.set(p.league, (leagues.get(p.league) || 0) + 1);
       if (p.late) late++;
-      lockedPicks.push(p);
     }
-    pool = buildPool(eligiblePicks({ maxMbc: minSizeOf(sys), groups: ALL_GOAL_GROUPS }), 4, 160);
+    const wide = buildPool(eligiblePicks({ maxMbc: minSizeOf(sys), groups: ALL_GOAL_GROUPS }), 4, 160);
+    // drop chosen-type picks one by one (least likely first) until the rest can be completed
+    for (let k = keep.length; k >= lockedPicks.length && !(r && r.picks.length >= sys.n); k--) {
+      r = optimizeSystem(wide, optOptions(keep.slice(0, k), sys));
+    }
   }
-  const r = optimizeSystem(pool, optOptions(lockedPicks, sys));
   const base = { locked: prev.locked, excluded: prev.excluded, sys, ranking: prev.ranking || null };
   if (!r) {
     state.coupon = { ...base, ids: lockedPicks.map((p) => p.id) };
@@ -666,10 +671,11 @@ function renderKupon() {
   const need = couponSys().n;
   let body = '';
   if (!picks.length || picks.length < need) {
-    const now = Date.now() / 1000;
-    const elig = state.events.filter((e) => eventEligible(e, now));
-    const todayN = elig.filter((e) => e.d < nextMidnight()).length;
-    const lateN = elig.length - todayN;
+    // count only matches that still have a usable high-odds goal pick
+    const usable = new Map();
+    for (const p of eligiblePicks({ groups: ALL_GOAL_GROUPS })) usable.set(p.eventId, p.late);
+    const lateN = [...usable.values()].filter(Boolean).length;
+    const todayN = usable.size - lateN;
     const maxLate = s.maxLate ?? 3;
     body = todayN + Math.min(lateN, maxLate) < need && s.window === 'today'
       ? `<div class="warnbox mt12">Bugün için kalan maçlar ${need} maçlık kupona yetmiyor (bugün ${todayN} maç + gece 00:00'dan sonra en fazla ${maxLate} maç). <b>Yarının kuponu 00:00'da hazırlanır.</b></div>`

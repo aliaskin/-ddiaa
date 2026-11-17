@@ -88,7 +88,7 @@ export function agreement(pick, tips) {
   const ft = tips?.find((t) => t.side);
   if (!ft) return null;
   let ours = null;
-  if (pick.key === '1_1' && pick.no === 2) ours = 'D';
+  if ((pick.key === '1_1' && pick.no === 2) || (pick.winH !== null && pick.winH !== undefined && pick.winH + (pick.winA ?? 0) < 0.05)) ours = 'D';
   else if ((pick.winH ?? 0) > 0.95) ours = 'H';
   else if ((pick.winA ?? 0) > 0.95) ours = 'A';
   if (!ours) return null;

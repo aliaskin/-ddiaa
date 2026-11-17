@@ -1,7 +1,7 @@
 // Coupon optimizer: chooses one pick per match so that the chosen system
 // (e.g. 3-4-5-6 with 6 matches) maximizes the selected objective.
 
-import { quickEval, evaluateSystem, columnCount } from './system.js?v=8';
+import { quickEval, evaluateSystem, columnCount } from './system.js?v=9';
 
 export const OBJECTIVES = {
   hedef: { name: 'Hedef kazanç', desc: 'Belirlediğin hedef kazanca (ör. 10.000 TL) ulaşma olasılığını en yükseğe çıkarır.', f: (r) => r.pTarget + 0.01 * (r.evRatio - 1) },
@@ -38,19 +38,25 @@ export function filterPicks(allPicks, opts) {
 }
 
 // Keep a manageable pool: best few picks per match, ranked by value.
+// Every match keeps at least its best pick, so rules like "max 3 after midnight" or
+// "max 2 per league" can still be met when the top values all come from a few matches.
 export function buildPool(picks, perEvent = 4, size = 160) {
   const byEvent = new Map();
   for (const p of picks) {
     if (!byEvent.has(p.eventId)) byEvent.set(p.eventId, []);
     byEvent.get(p.eventId).push(p);
   }
-  const pool = [];
+  const firsts = [], rest = [];
   for (const list of byEvent.values()) {
     list.sort((a, b) => b.v - a.v);
-    pool.push(...list.slice(0, perEvent));
+    firsts.push(list[0]);
+    rest.push(...list.slice(1, perEvent));
   }
-  pool.sort((a, b) => b.v - a.v);
-  return pool.slice(0, size);
+  firsts.sort((a, b) => b.v - a.v);
+  rest.sort((a, b) => b.v - a.v);
+  const pool = firsts.slice(0, Math.max(size, 0));
+  for (const p of rest) { if (pool.length >= size) break; pool.push(p); }
+  return pool.sort((a, b) => b.v - a.v);
 }
 
 function makeScorer(sizes, misli, unit, n, objective, target = Infinity) {
